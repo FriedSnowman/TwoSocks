@@ -4,6 +4,8 @@
 #undef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
 
+#include <stdint.h>
+
 enum socksstate {
     SS_1_CONNECTED,
     SS_2_NEED_AUTH, /* skipped if NO_AUTH method supported */
@@ -52,5 +54,21 @@ enum socks5_socket_type {
 
 #define MAX_DNS_LEN    ((2 << 8) - 1)
 #define MAX_SOCKS5_HEADER_LEN (2 + 1 + 1 + 1 + MAX_DNS_LEN + 2)
+
+typedef struct TwoSocksStatsSnapshot {
+    uint64_t uploadBytes;
+    uint64_t downloadBytes;
+    uint32_t activeClients;
+    uint32_t successfulConnections;
+    uint32_t failedConnections;
+    uint32_t totalClientSessions;
+    uint32_t serverIsRunning;
+    int32_t lastServerErrorCode;
+} TwoSocksStatsSnapshot;
+
+int socks_main(int argc, char** argv);
+int twosocks_dequeue_connection_log(char *buffer, int bufferLength);
+void twosocks_get_stats_snapshot(TwoSocksStatsSnapshot *snapshot);
+void twosocks_reset_runtime_state(void);
 
 #endif

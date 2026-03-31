@@ -4,6 +4,7 @@ import SwiftUI
 
 private let maxConnectionAttemptLogEntries = 150
 private let connectionLogMessageBufferSize = 512
+private let proxyPort = 4884
 
 private func drainNativeConnectionLogs() -> [String] {
     var messages: [String] = []
@@ -22,99 +23,266 @@ private func drainNativeConnectionLogs() -> [String] {
     return messages
 }
 
+private func readNativeRuntimeStats() -> ProxyRuntimeStats {
+    var snapshot = TwoSocksStatsSnapshot()
+    twosocks_get_stats_snapshot(&snapshot)
+    return ProxyRuntimeStats(snapshot: snapshot)
+}
+
+enum ProxyServerState: Equatable {
+    case waitingForNetwork
+    case starting
+    case running
+    case failed(Int32)
+
+    var title: String {
+        switch self {
+        case .waitingForNetwork:
+            return "Awaiting Network"
+        case .starting:
+            return "Starting"
+        case .running:
+            return "Running"
+        case .failed:
+            return "Failed"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .waitingForNetwork:
+            return "No usable local interface detected yet."
+        case .starting:
+            return "Opening the SOCKS listener."
+        case .running:
+            return "Proxy is listening for new clients."
+        case .failed(let code):
+            return "Native server exited with code \(code)."
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .waitingForNetwork:
+            return "network.slash"
+        case .starting:
+            return "dot.radiowaves.left.and.right"
+        case .running:
+            return "checkmark.circle.fill"
+        case .failed:
+            return "xmark.octagon.fill"
+        }
+    }
+
+    var tint: Color {
+        switch self {
+        case .waitingForNetwork:
+            return .orange
+        case .starting:
+            return .blue
+        case .running:
+            return .green
+        case .failed:
+            return .red
+        }
+    }
+}
+
+enum ConnectionLogCategory {
+    case success
+    case failure
+    case info
+
+    var title: String {
+        switch self {
+        case .success:
+            return "Connected"
+        case .failure:
+            return "Failed"
+        case .info:
+            return "Info"
+        }
+    }
+
+    var tint: Color {
+        switch self {
+        case .success:
+            return .green
+        case .failure:
+            return .red
+        case .info:
+            return .blue
+        }
+    }
+}
+
+struct ProxyRuntimeStats {
+    var uploadBytes: UInt64 = 0
+    var downloadBytes: UInt64 = 0
+    var activeClients: Int = 0
+    var successfulConnections: Int = 0
+    var failedConnections: Int = 0
+    var totalClientSessions: Int = 0
+    var serverIsRunning = false
+    var lastServerErrorCode: Int32 = 0
+
+    init() {}
+
+    init(snapshot: TwoSocksStatsSnapshot) {
+        uploadBytes = snapshot.uploadBytes
+        downloadBytes = snapshot.downloadBytes
+        activeClients = Int(snapshot.activeClients)
+        successfulConnections = Int(snapshot.successfulConnections)
+        failedConnections = Int(snapshot.failedConnections)
+        totalClientSessions = Int(snapshot.totalClientSessions)
+        serverIsRunning = snapshot.serverIsRunning != 0
+        lastServerErrorCode = snapshot.lastServerErrorCode
+    }
+
+    var totalConnectionAttempts: Int {
+        successfulConnections + failedConnections
+    }
+}
+
 struct ConnectionAttemptLogEntry: Identifiable {
     let id = UUID()
     let timestamp = Date()
     let message: String
 
-    var isFailure: Bool {
-        message.localizedCaseInsensitiveContains("failed")
+    var category: ConnectionLogCategory {
+        if message.localizedCaseInsensitiveContains("failed") {
+            return .failure
+        }
+        if message.localizedCaseInsensitiveContains("connected") {
+            return .success
+        }
+        return .info
+    }
+
+    var endpoint: String {
+        if let boundary = message.range(of: " failed") {
+            return String(message[..<boundary.lowerBound])
+        }
+        if let boundary = message.range(of: " connected") {
+            return String(message[..<boundary.lowerBound])
+        }
+        return message
+    }
+
+    var detail: String {
+        if let boundary = message.range(of: " failed") {
+            let suffix = message[boundary.lowerBound...].trimmingCharacters(in: .whitespaces)
+            return suffix.isEmpty ? "Failed" : suffix.prefix(1).uppercased() + String(suffix.dropFirst())
+        }
+        if message.localizedCaseInsensitiveContains("connected") {
+            return "Connected"
+        }
+        return message
     }
 }
 
 @MainActor
 class ContentViewVM: ObservableObject {
-    @Published var statusMessage: String = "Starting..."
-    @Published var connectionAttemptLogs: [ConnectionAttemptLogEntry] = []
+    @Published private(set) var serverState: ProxyServerState = .starting
+    @Published private(set) var endpointDisplay = "Detecting local IP"
+    @Published private(set) var runtimeStats = ProxyRuntimeStats()
+    @Published private(set) var serverStartedAt: Date?
+    @Published private(set) var connectionAttemptLogs: [ConnectionAttemptLogEntry] = []
 
     private var audioPlayer: AVAudioPlayer?
-    private var connectionLogPollingTask: Task<Void, Never>?
-
-    private var updateStatus: (String) -> Void {
-        { [weak self] message in
-            Task { @MainActor in
-                self?.statusMessage = message
-            }
-        }
-    }
+    private var runtimePollingTask: Task<Void, Never>?
+    private var hasStartedProxy = false
 
     init() {
         setupBackgroundAudio()
     }
 
     deinit {
-        connectionLogPollingTask?.cancel()
+        runtimePollingTask?.cancel()
+    }
+
+    func setInterfaceUnavailable() {
+        serverState = .waitingForNetwork
+        endpointDisplay = "bridge100/en0 not available"
+        runtimeStats = ProxyRuntimeStats()
     }
 
     func startProxy(ipAddress: String) {
-        startConnectionLogPolling()
+        guard !hasStartedProxy else { return }
 
-        let port = 4884
-        let updateStatus = self.updateStatus
+        hasStartedProxy = true
+        serverState = .starting
+        endpointDisplay = "\(ipAddress):\(proxyPort)"
+        runtimeStats = ProxyRuntimeStats()
+        connectionAttemptLogs = []
+        serverStartedAt = nil
+        twosocks_reset_runtime_state()
+        startRuntimePolling()
 
-        Task.detached(priority: .userInitiated) {
-            let arguments = ["microsocks", "-p", String(port)]
-
-            // Convert arguments to C-style parameters
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let arguments = ["microsocks", "-p", String(proxyPort)]
             let cArgs = arguments.map { strdup($0) }
             defer { cArgs.forEach { free($0) } }
 
             let argc = Int32(arguments.count)
-            let argv = UnsafeMutablePointer<UnsafePointer<Int8>?>.allocate(capacity: arguments.count + 1)
+            let argv = UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>.allocate(capacity: arguments.count + 1)
             defer { argv.deallocate() }
 
-            // Set up arguments
             for (index, arg) in cArgs.enumerated() {
-                argv[index] = UnsafePointer(arg)
+                argv[index] = arg
             }
             argv[arguments.count] = nil
 
-            updateStatus("Running at \(ipAddress):\(port)")
-
-            // Start SOCKS server
             let status = socks_main(argc, argv)
-
-            if status != 0 {
-                updateStatus("Failed to start: \(status)")
-            }
+            guard status != 0 else { return }
+            await self?.markServerFailed(code: Int32(status))
         }
     }
 
-    private func startConnectionLogPolling() {
-        guard connectionLogPollingTask == nil else { return }
+    private func startRuntimePolling() {
+        guard runtimePollingTask == nil else { return }
 
-        connectionLogPollingTask = Task.detached(priority: .utility) { [weak self] in
+        runtimePollingTask = Task.detached(priority: .utility) { [weak self] in
             while !Task.isCancelled {
                 let messages = drainNativeConnectionLogs()
+                let stats = readNativeRuntimeStats()
 
-                if !messages.isEmpty {
-                    guard let self else { break }
-                    await self.appendConnectionLogs(messages)
-                }
+                guard let self else { break }
+                await self.refreshRuntimeState(stats: stats, newMessages: messages)
 
                 try? await Task.sleep(for: .milliseconds(250))
             }
         }
     }
 
-    private func appendConnectionLogs(_ messages: [String]) {
-        for message in messages {
-            appendConnectionLog(message)
+    private func refreshRuntimeState(stats: ProxyRuntimeStats, newMessages: [String]) {
+        runtimeStats = stats
+
+        if !newMessages.isEmpty {
+            appendConnectionLogs(newMessages)
+        }
+
+        if stats.serverIsRunning {
+            serverState = .running
+            if serverStartedAt == nil {
+                serverStartedAt = Date()
+            }
+        } else if stats.lastServerErrorCode != 0 {
+            markServerFailed(code: stats.lastServerErrorCode)
+        } else if hasStartedProxy {
+            serverState = .starting
         }
     }
 
-    private func appendConnectionLog(_ message: String) {
-        connectionAttemptLogs.insert(ConnectionAttemptLogEntry(message: message), at: 0)
+    private func markServerFailed(code: Int32) {
+        serverState = .failed(code)
+        serverStartedAt = nil
+    }
+
+    private func appendConnectionLogs(_ messages: [String]) {
+        for message in messages {
+            connectionAttemptLogs.insert(ConnectionAttemptLogEntry(message: message), at: 0)
+        }
 
         if connectionAttemptLogs.count > maxConnectionAttemptLogEntries {
             connectionAttemptLogs.removeLast(connectionAttemptLogs.count - maxConnectionAttemptLogEntries)

@@ -79,6 +79,8 @@ static pthread_mutex_t connection_log_lock = PTHREAD_MUTEX_INITIALIZER;
 static char connection_logs[CONNECTION_LOG_CAPACITY][CONNECTION_LOG_MESSAGE_LENGTH];
 static int connection_log_start = 0;
 static int connection_log_count = 0;
+static pthread_mutex_t runtime_stats_lock = PTHREAD_MUTEX_INITIALIZER;
+static TwoSocksStatsSnapshot runtime_stats = {0};
 
 struct thread {
     pthread_t pt;
@@ -256,6 +258,69 @@ int twosocks_dequeue_connection_log(char *buffer, int bufferLength) {
     connection_log_count--;
     pthread_mutex_unlock(&connection_log_lock);
     return 1;
+}
+
+static void add_transfer_bytes(uint64_t uploadBytes, uint64_t downloadBytes) {
+    if (uploadBytes == 0 && downloadBytes == 0) return;
+    if (pthread_mutex_lock(&runtime_stats_lock) != 0) return;
+    runtime_stats.uploadBytes += uploadBytes;
+    runtime_stats.downloadBytes += downloadBytes;
+    pthread_mutex_unlock(&runtime_stats_lock);
+}
+
+static void note_client_session_started(void) {
+    if (pthread_mutex_lock(&runtime_stats_lock) != 0) return;
+    runtime_stats.activeClients++;
+    runtime_stats.totalClientSessions++;
+    pthread_mutex_unlock(&runtime_stats_lock);
+}
+
+static void note_client_session_ended(void) {
+    if (pthread_mutex_lock(&runtime_stats_lock) != 0) return;
+    if (runtime_stats.activeClients > 0) {
+        runtime_stats.activeClients--;
+    }
+    pthread_mutex_unlock(&runtime_stats_lock);
+}
+
+static void note_connection_result(int didSucceed) {
+    if (pthread_mutex_lock(&runtime_stats_lock) != 0) return;
+    if (didSucceed) {
+        runtime_stats.successfulConnections++;
+    } else {
+        runtime_stats.failedConnections++;
+    }
+    pthread_mutex_unlock(&runtime_stats_lock);
+}
+
+static void update_server_state(int isRunning, int errorCode) {
+    if (pthread_mutex_lock(&runtime_stats_lock) != 0) return;
+    runtime_stats.serverIsRunning = (uint32_t)isRunning;
+    runtime_stats.lastServerErrorCode = (int32_t)errorCode;
+    pthread_mutex_unlock(&runtime_stats_lock);
+}
+
+void twosocks_get_stats_snapshot(TwoSocksStatsSnapshot *snapshot) {
+    if (snapshot == NULL) return;
+    if (pthread_mutex_lock(&runtime_stats_lock) != 0) {
+        memset(snapshot, 0, sizeof(*snapshot));
+        return;
+    }
+    *snapshot = runtime_stats;
+    pthread_mutex_unlock(&runtime_stats_lock);
+}
+
+void twosocks_reset_runtime_state(void) {
+    if (pthread_mutex_lock(&connection_log_lock) == 0) {
+        connection_log_start = 0;
+        connection_log_count = 0;
+        pthread_mutex_unlock(&connection_log_lock);
+    }
+
+    if (pthread_mutex_lock(&runtime_stats_lock) == 0) {
+        memset(&runtime_stats, 0, sizeof runtime_stats);
+        pthread_mutex_unlock(&runtime_stats_lock);
+    }
 }
 
 static int parse_socks_request_header(
@@ -445,6 +510,11 @@ static void copyloop(int fd1, int fd2) {
             if(m < 0) return;
             sent += m;
         }
+        if (infd == fd1) {
+            add_transfer_bytes((uint64_t)sent, 0);
+        } else {
+            add_transfer_bytes(0, (uint64_t)sent);
+        }
     }
 }
 
@@ -605,6 +675,7 @@ static void copy_loop_udp(int tcp_fd, int udp_fd) {
                 perror("send");
                 goto UDP_LOOP_END;
             }
+            add_transfer_bytes((uint64_t)ret, 0);
         }
 
         // UDP sockets for target addresses
@@ -660,6 +731,7 @@ static void copy_loop_udp(int tcp_fd, int udp_fd) {
                     perror("write to udp_fd");
                     goto UDP_LOOP_END;
                 }
+                add_transfer_bytes(0, (uint64_t)n);
             }
         }
     }
@@ -744,6 +816,7 @@ int udp_svc_setup(union sockaddr_union* client_addr) {
 static void* clientthread(void *data) {
     struct thread *t = data;
     t->state = SS_1_CONNECTED;
+    note_client_session_started();
     unsigned char buf[1024];
     ssize_t n;
     int ret;
@@ -782,6 +855,7 @@ static void* clientthread(void *data) {
                     if (requested_addr.type != SOCKS5_ADDR_UNKNOWN && cmd == CONNECT) {
                         char endpoint[320];
                         format_addrport(&requested_addr, endpoint, sizeof endpoint);
+                        note_connection_result(0);
                         emit_connection_logf("%s failed (%s)", endpoint, describe_request_error(&requested_addr, ret));
                     }
                     goto breakloop;
@@ -792,10 +866,12 @@ static void* clientthread(void *data) {
                     format_addrport(&requested_addr, endpoint, sizeof endpoint);
                     ret = connect_socks_target(&address, &t->client);
                     if(ret < 0) {
+                        note_connection_result(0);
                         emit_connection_logf("%s failed (%s)", endpoint, describe_request_error(&requested_addr, ret));
                         send_error(t->client.fd, ret*-1);
                         goto breakloop;
                     }
+                    note_connection_result(1);
                     emit_connection_logf("%s connected", endpoint);
                     int remotefd = ret;
                     socklen_t len = sizeof(union sockaddr_union);
@@ -845,6 +921,7 @@ static void* clientthread(void *data) {
 breakloop:
 
     close(t->client.fd);
+    note_client_session_ended();
     t->done = 1;
 
     return 0;
@@ -889,6 +966,7 @@ static void zero_arg(char *s) {
 }
 
 int socks_main(int argc, char** argv) {
+    twosocks_reset_runtime_state();
     int ch;
     const char *listenip = "0.0.0.0";
     unsigned port = 1080;
@@ -933,10 +1011,12 @@ int socks_main(int argc, char** argv) {
     struct server s;
     sblist *threads = sblist_new(sizeof (struct thread*), 8);
     if(server_setup(&s, listenip, port)) {
+        update_server_state(0, 1);
         perror("server_setup");
         return 1;
     }
     server = &s;
+    update_server_state(1, 0);
 
     while(1) {
         collect(threads);
@@ -964,8 +1044,13 @@ int socks_main(int argc, char** argv) {
             a = &attr;
             pthread_attr_setstacksize(a, THREAD_STACK_SIZE);
         }
-        if(pthread_create(&curr->pt, a, clientthread, curr) != 0)
+        if(pthread_create(&curr->pt, a, clientthread, curr) != 0) {
             dolog("pthread_create failed. OOM?\n");
+            close(curr->client.fd);
+            sblist_delete(threads, sblist_getsize(threads) - 1);
+            free(curr);
+            usleep(FAILURE_TIMEOUT);
+        }
         if(a) pthread_attr_destroy(&attr);
     }
 }

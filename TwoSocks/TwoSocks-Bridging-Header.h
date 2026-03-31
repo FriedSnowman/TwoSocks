@@ -8,8 +8,6 @@
 #ifndef TwoSocks_Bridging_Header_h
 #define TwoSocks_Bridging_Header_h
 
-// Expose the socks_main function from C
-extern int socks_main(int argc, const char** argv);
-extern int twosocks_dequeue_connection_log(char *buffer, int bufferLength);
+#include "microsocks/sockssrv.h"
 
 #endif /* TwoSocks_Bridging_Header_h */
