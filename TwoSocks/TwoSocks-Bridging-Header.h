@@ -10,5 +10,6 @@
 
 // Expose the socks_main function from C
 extern int socks_main(int argc, const char** argv);
+extern int twosocks_dequeue_connection_log(char *buffer, int bufferLength);
 
 #endif /* TwoSocks_Bridging_Header_h */

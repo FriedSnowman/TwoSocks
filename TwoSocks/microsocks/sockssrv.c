@@ -28,6 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <pthread.h>
 #include <signal.h>
 #include <poll.h>
@@ -70,6 +71,14 @@ static const char* auth_pass;
 static sblist* auth_ips;
 static pthread_rwlock_t auth_ips_lock = PTHREAD_RWLOCK_INITIALIZER;
 static const struct server* server;
+
+#define CONNECTION_LOG_CAPACITY 256
+#define CONNECTION_LOG_MESSAGE_LENGTH 512
+
+static pthread_mutex_t connection_log_lock = PTHREAD_MUTEX_INITIALIZER;
+static char connection_logs[CONNECTION_LOG_CAPACITY][CONNECTION_LOG_MESSAGE_LENGTH];
+static int connection_log_start = 0;
+static int connection_log_count = 0;
 
 struct thread {
     pthread_t pt;
@@ -164,7 +173,98 @@ static int parse_addrport(unsigned char *buf, size_t n, struct socks5_addrport* 
     return minlen;
 }
 
-static int parse_socks_request_header(unsigned char *buf, size_t n, int* cmd, union sockaddr_union* svc_addr) {
+static void format_addrport(const struct socks5_addrport* addrport, char* buffer, size_t length) {
+    if (addrport == NULL || buffer == NULL || length == 0) return;
+
+    if (addrport->type == SOCKS5_IPV6) {
+        snprintf(buffer, length, "[%s]:%hu", addrport->addr, addrport->port);
+    } else {
+        snprintf(buffer, length, "%s:%hu", addrport->addr, addrport->port);
+    }
+}
+
+static const char* describe_errorcode(enum errorcode code) {
+    switch (code) {
+        case EC_SUCCESS:
+            return "success";
+        case EC_GENERAL_FAILURE:
+            return "general failure";
+        case EC_NOT_ALLOWED:
+            return "not allowed";
+        case EC_NET_UNREACHABLE:
+            return "network unreachable";
+        case EC_HOST_UNREACHABLE:
+            return "host unreachable";
+        case EC_CONN_REFUSED:
+            return "connection refused";
+        case EC_TTL_EXPIRED:
+            return "timeout";
+        case EC_COMMAND_NOT_SUPPORTED:
+            return "command not supported";
+        case EC_ADDRESSTYPE_NOT_SUPPORTED:
+            return "address type not supported";
+        case EC_BIND_IP_NOT_PROVIDED:
+            return "bind IP not provided";
+        default:
+            return "unknown error";
+    }
+}
+
+static const char* describe_request_error(const struct socks5_addrport* addrport, int code) {
+    if (code == -EC_GENERAL_FAILURE && addrport != NULL && addrport->type == SOCKS5_DNS) {
+        return "DNS lookup failed";
+    }
+
+    return describe_errorcode((enum errorcode)(-code));
+}
+
+static void emit_connection_logf(const char* fmt, ...) {
+    if (fmt == NULL) return;
+
+    char message[CONNECTION_LOG_MESSAGE_LENGTH];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(message, sizeof message, fmt, args);
+    va_end(args);
+
+    if (pthread_mutex_lock(&connection_log_lock) != 0) return;
+
+    int index = (connection_log_start + connection_log_count) % CONNECTION_LOG_CAPACITY;
+    strncpy(connection_logs[index], message, CONNECTION_LOG_MESSAGE_LENGTH - 1);
+    connection_logs[index][CONNECTION_LOG_MESSAGE_LENGTH - 1] = '\0';
+
+    if (connection_log_count == CONNECTION_LOG_CAPACITY) {
+        connection_log_start = (connection_log_start + 1) % CONNECTION_LOG_CAPACITY;
+    } else {
+        connection_log_count++;
+    }
+
+    pthread_mutex_unlock(&connection_log_lock);
+}
+
+int twosocks_dequeue_connection_log(char *buffer, int bufferLength) {
+    if (buffer == NULL || bufferLength <= 0) return 0;
+    if (pthread_mutex_lock(&connection_log_lock) != 0) return 0;
+    if (connection_log_count == 0) {
+        pthread_mutex_unlock(&connection_log_lock);
+        return 0;
+    }
+
+    strncpy(buffer, connection_logs[connection_log_start], (size_t)bufferLength - 1);
+    buffer[bufferLength - 1] = '\0';
+    connection_log_start = (connection_log_start + 1) % CONNECTION_LOG_CAPACITY;
+    connection_log_count--;
+    pthread_mutex_unlock(&connection_log_lock);
+    return 1;
+}
+
+static int parse_socks_request_header(
+    unsigned char *buf,
+    size_t n,
+    int* cmd,
+    union sockaddr_union* svc_addr,
+    struct socks5_addrport* requested_addr
+) {
     assert(svc_addr != NULL);
     if(n < 3) return -EC_GENERAL_FAILURE;
     if(buf[0] != VERSION) return -EC_GENERAL_FAILURE;
@@ -176,6 +276,9 @@ static int parse_socks_request_header(unsigned char *buf, size_t n, int* cmd, un
     int ret = parse_addrport(buf + 3, n - 3, &addrport);
     if (ret < 0) {
         return ret;
+    }
+    if (requested_addr != NULL) {
+        *requested_addr = addrport;
     }
     int socktype = *cmd == CONNECT? TCP_SOCKET : UDP_SOCKET;
     ret = resolveSocks5Addrport(&addrport, socktype, svc_addr);
@@ -647,6 +750,7 @@ static void* clientthread(void *data) {
     // for CONNECT, this is target TCP address
     // for UDP ASSOCIATE, this is client UDP address
     union sockaddr_union address, local_addr;
+    struct socks5_addrport requested_addr = {0};
 
     enum authmethod am;
     while((n = recv(t->client.fd, buf, sizeof buf, 0)) > 0) {
@@ -672,18 +776,27 @@ static void* clientthread(void *data) {
                 break;
             case SS_3_AUTHED:
                 (void)0;
-                int cmd;
-                ret = parse_socks_request_header(buf, n, &cmd, &address);
+                int cmd = 0;
+                ret = parse_socks_request_header(buf, n, &cmd, &address, &requested_addr);
                 if (ret != EC_SUCCESS) {
+                    if (requested_addr.type != SOCKS5_ADDR_UNKNOWN && cmd == CONNECT) {
+                        char endpoint[320];
+                        format_addrport(&requested_addr, endpoint, sizeof endpoint);
+                        emit_connection_logf("%s failed (%s)", endpoint, describe_request_error(&requested_addr, ret));
+                    }
                     goto breakloop;
                 }
                 
                 if (cmd == CONNECT) {
+                    char endpoint[320];
+                    format_addrport(&requested_addr, endpoint, sizeof endpoint);
                     ret = connect_socks_target(&address, &t->client);
                     if(ret < 0) {
+                        emit_connection_logf("%s failed (%s)", endpoint, describe_request_error(&requested_addr, ret));
                         send_error(t->client.fd, ret*-1);
                         goto breakloop;
                     }
+                    emit_connection_logf("%s connected", endpoint);
                     int remotefd = ret;
                     socklen_t len = sizeof(union sockaddr_union);
                     if (getsockname(remotefd, (struct sockaddr*)&local_addr, &len)) goto breakloop;
