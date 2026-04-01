@@ -74,6 +74,7 @@ static const struct server* server;
 
 #define CONNECTION_LOG_CAPACITY 256
 #define CONNECTION_LOG_MESSAGE_LENGTH 512
+#define TRANSFER_STATS_BATCH_BYTES 8192
 
 static pthread_mutex_t connection_log_lock = PTHREAD_MUTEX_INITIALIZER;
 static char connection_logs[CONNECTION_LOG_CAPACITY][CONNECTION_LOG_MESSAGE_LENGTH];
@@ -266,6 +267,32 @@ static void add_transfer_bytes(uint64_t uploadBytes, uint64_t downloadBytes) {
     runtime_stats.uploadBytes += uploadBytes;
     runtime_stats.downloadBytes += downloadBytes;
     pthread_mutex_unlock(&runtime_stats_lock);
+}
+
+struct transfer_stats_batch {
+    uint64_t uploadBytes;
+    uint64_t downloadBytes;
+};
+
+static void flush_transfer_stats_batch(struct transfer_stats_batch *batch) {
+    if (batch == NULL) return;
+    add_transfer_bytes(batch->uploadBytes, batch->downloadBytes);
+    batch->uploadBytes = 0;
+    batch->downloadBytes = 0;
+}
+
+static void add_transfer_bytes_batched(
+    struct transfer_stats_batch *batch,
+    uint64_t uploadBytes,
+    uint64_t downloadBytes
+) {
+    if (batch == NULL) return;
+    batch->uploadBytes += uploadBytes;
+    batch->downloadBytes += downloadBytes;
+
+    if (batch->uploadBytes + batch->downloadBytes >= TRANSFER_STATS_BATCH_BYTES) {
+        flush_transfer_stats_batch(batch);
+    }
 }
 
 static void note_client_session_started(void) {
@@ -487,6 +514,7 @@ static void copyloop(int fd1, int fd2) {
         [0] = {.fd = fd1, .events = POLLIN},
         [1] = {.fd = fd2, .events = POLLIN},
     };
+    struct transfer_stats_batch stats_batch = {0};
 
     while(1) {
         /* inactive connections are reaped after 15 min to free resources.
@@ -494,28 +522,30 @@ static void copyloop(int fd1, int fd2) {
            when a connection is really unused. */
         switch(poll(fds, 2, 60*15*1000)) {
             case 0:
-                return;
+                goto COPY_LOOP_END;
             case -1:
                 if(errno == EINTR || errno == EAGAIN) continue;
                 else perror("poll");
-                return;
+                goto COPY_LOOP_END;
         }
         int infd = (fds[0].revents & POLLIN) ? fd1 : fd2;
         int outfd = infd == fd2 ? fd1 : fd2;
         char buf[1024];
         ssize_t sent = 0, n = read(infd, buf, sizeof buf);
-        if(n <= 0) return;
+        if(n <= 0) goto COPY_LOOP_END;
         while(sent < n) {
             ssize_t m = write(outfd, buf+sent, n-sent);
-            if(m < 0) return;
+            if(m < 0) goto COPY_LOOP_END;
             sent += m;
         }
         if (infd == fd1) {
-            add_transfer_bytes((uint64_t)sent, 0);
+            add_transfer_bytes_batched(&stats_batch, (uint64_t)sent, 0);
         } else {
-            add_transfer_bytes(0, (uint64_t)sent);
+            add_transfer_bytes_batched(&stats_batch, 0, (uint64_t)sent);
         }
     }
+COPY_LOOP_END:
+    flush_transfer_stats_batch(&stats_batch);
 }
 
 // caller must free socks5_addr manually
@@ -560,6 +590,7 @@ static void copy_loop_udp(int tcp_fd, int udp_fd) {
         [0] = {.fd = tcp_fd, .events = POLLIN},
         [1] = {.fd = udp_fd, .events = POLLIN},
     };
+    struct transfer_stats_batch stats_batch = {0};
 
     int udp_is_bound = 1;
     union sockaddr_union client_addr;
@@ -675,7 +706,7 @@ static void copy_loop_udp(int tcp_fd, int udp_fd) {
                 perror("send");
                 goto UDP_LOOP_END;
             }
-            add_transfer_bytes((uint64_t)ret, 0);
+            add_transfer_bytes_batched(&stats_batch, (uint64_t)ret, 0);
         }
 
         // UDP sockets for target addresses
@@ -731,11 +762,12 @@ static void copy_loop_udp(int tcp_fd, int udp_fd) {
                     perror("write to udp_fd");
                     goto UDP_LOOP_END;
                 }
-                add_transfer_bytes(0, (uint64_t)n);
+                add_transfer_bytes_batched(&stats_batch, 0, (uint64_t)n);
             }
         }
     }
 UDP_LOOP_END:
+    flush_transfer_stats_batch(&stats_batch);
     for (int i = 2; i < poll_fds; i++)
         close(fds[i].fd);
     sblist_free(sock_list);

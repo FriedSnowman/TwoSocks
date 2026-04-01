@@ -5,6 +5,8 @@ import SwiftUI
 private let maxConnectionAttemptLogEntries = 150
 private let connectionLogMessageBufferSize = 512
 private let proxyPort = 4884
+private let activeRuntimePollingInterval = Duration.milliseconds(250)
+private let idleRuntimePollingInterval = Duration.seconds(1)
 
 private func drainNativeConnectionLogs() -> [String] {
     var messages: [String] = []
@@ -116,7 +118,7 @@ enum ConnectionLogCategory {
     }
 }
 
-struct ProxyRuntimeStats {
+struct ProxyRuntimeStats: Equatable {
     var uploadBytes: UInt64 = 0
     var downloadBytes: UInt64 = 0
     var activeClients: Int = 0
@@ -243,40 +245,56 @@ class ContentViewVM: ObservableObject {
         guard runtimePollingTask == nil else { return }
 
         runtimePollingTask = Task.detached(priority: .utility) { [weak self] in
+            var lastObservedStats: ProxyRuntimeStats?
+
             while !Task.isCancelled {
                 let messages = drainNativeConnectionLogs()
                 let stats = readNativeRuntimeStats()
+                let didStatsChange = lastObservedStats != stats
 
                 guard let self else { break }
-                await self.refreshRuntimeState(stats: stats, newMessages: messages)
+                if didStatsChange || !messages.isEmpty {
+                    await self.refreshRuntimeState(stats: stats, newMessages: messages)
+                }
 
-                try? await Task.sleep(for: .milliseconds(250))
+                lastObservedStats = stats
+
+                try? await Task.sleep(for: Self.runtimePollingInterval(for: stats, hasPendingMessages: !messages.isEmpty))
             }
         }
     }
 
     private func refreshRuntimeState(stats: ProxyRuntimeStats, newMessages: [String]) {
-        runtimeStats = stats
+        if runtimeStats != stats {
+            runtimeStats = stats
+        }
 
         if !newMessages.isEmpty {
             appendConnectionLogs(newMessages)
         }
 
-        if stats.serverIsRunning {
-            serverState = .running
+        let nextServerState = derivedServerState(from: stats)
+        if serverState != nextServerState {
+            serverState = nextServerState
+        }
+
+        if nextServerState == .running {
             if serverStartedAt == nil {
                 serverStartedAt = Date()
             }
-        } else if stats.lastServerErrorCode != 0 {
-            markServerFailed(code: stats.lastServerErrorCode)
-        } else if hasStartedProxy {
-            serverState = .starting
+        } else if serverStartedAt != nil {
+            serverStartedAt = nil
         }
     }
 
     private func markServerFailed(code: Int32) {
-        serverState = .failed(code)
-        serverStartedAt = nil
+        let failedState = ProxyServerState.failed(code)
+        if serverState != failedState {
+            serverState = failedState
+        }
+        if serverStartedAt != nil {
+            serverStartedAt = nil
+        }
     }
 
     private func appendConnectionLogs(_ messages: [String]) {
@@ -313,6 +331,29 @@ class ContentViewVM: ObservableObject {
         } catch {
             print("Failed to setup background audio:", error.localizedDescription)
         }
+    }
+
+    private func derivedServerState(from stats: ProxyRuntimeStats) -> ProxyServerState {
+        if stats.serverIsRunning {
+            return .running
+        }
+        if stats.lastServerErrorCode != 0 {
+            return .failed(stats.lastServerErrorCode)
+        }
+        if hasStartedProxy {
+            return .starting
+        }
+        return .waitingForNetwork
+    }
+
+    private static func runtimePollingInterval(for stats: ProxyRuntimeStats, hasPendingMessages: Bool) -> Duration {
+        if stats.lastServerErrorCode != 0 {
+            return idleRuntimePollingInterval
+        }
+        if hasPendingMessages || stats.activeClients > 0 || !stats.serverIsRunning {
+            return activeRuntimePollingInterval
+        }
+        return idleRuntimePollingInterval
     }
 }
 
