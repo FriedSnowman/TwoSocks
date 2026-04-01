@@ -251,15 +251,16 @@ class ContentViewVM: ObservableObject {
                 let messages = drainNativeConnectionLogs()
                 let stats = readNativeRuntimeStats()
                 let didStatsChange = lastObservedStats != stats
+                let didObserveActivity = didStatsChange || !messages.isEmpty
 
                 guard let self else { break }
-                if didStatsChange || !messages.isEmpty {
+                if didObserveActivity {
                     await self.refreshRuntimeState(stats: stats, newMessages: messages)
                 }
 
                 lastObservedStats = stats
 
-                try? await Task.sleep(for: Self.runtimePollingInterval(for: stats, hasPendingMessages: !messages.isEmpty))
+                try? await Task.sleep(for: Self.runtimePollingInterval(for: stats, observedActivity: didObserveActivity))
             }
         }
     }
@@ -346,11 +347,11 @@ class ContentViewVM: ObservableObject {
         return .waitingForNetwork
     }
 
-    private static func runtimePollingInterval(for stats: ProxyRuntimeStats, hasPendingMessages: Bool) -> Duration {
+    private static func runtimePollingInterval(for stats: ProxyRuntimeStats, observedActivity: Bool) -> Duration {
         if stats.lastServerErrorCode != 0 {
             return idleRuntimePollingInterval
         }
-        if hasPendingMessages || stats.activeClients > 0 || !stats.serverIsRunning {
+        if observedActivity || stats.activeClients > 0 || !stats.serverIsRunning {
             return activeRuntimePollingInterval
         }
         return idleRuntimePollingInterval

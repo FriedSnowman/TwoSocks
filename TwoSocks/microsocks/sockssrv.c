@@ -72,7 +72,7 @@ static sblist* auth_ips;
 static pthread_rwlock_t auth_ips_lock = PTHREAD_RWLOCK_INITIALIZER;
 static const struct server* server;
 
-#define CONNECTION_LOG_CAPACITY 256
+#define CONNECTION_LOG_CAPACITY 1024
 #define CONNECTION_LOG_MESSAGE_LENGTH 512
 #define TRANSFER_STATS_BATCH_BYTES 8192
 
