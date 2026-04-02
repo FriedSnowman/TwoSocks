@@ -127,26 +127,12 @@ struct ContentView: View {
                 secondaryTitle: "Total",
                 secondaryValue: viewModel.lifetimeUploadedDisplay
             )
-
-            MetricCard(
-                title: "Active Clients",
-                value: "\(viewModel.activeConnectionCount)",
-                symbol: "person.2.fill",
-                tint: .indigo
-            )
-
-            MetricCard(
-                title: "Attempts",
-                value: "\(viewModel.totalConnectionAttempts)",
-                symbol: "bolt.horizontal.circle.fill",
-                tint: .green
-            )
         }
     }
 
     private var connectionsPanel: some View {
         DashboardPanel(
-            title: "Connections"
+            title: viewModel.connectionsPanelTitle
         ) {
             if viewModel.connections.isEmpty {
                 ContentUnavailableView {

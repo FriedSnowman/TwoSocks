@@ -159,8 +159,6 @@ final class ContentViewVM: ObservableObject {
     @Published private(set) var serverState: ProxyServerState = .starting
     @Published private(set) var endpointDisplay = "Detecting local IP"
     @Published private(set) var connections: [TrackedConnection] = []
-    @Published private(set) var activeConnectionCount = 0
-    @Published private(set) var totalConnectionAttempts = 0
     @Published private(set) var sessionDownloadedBytes: UInt64 = 0
     @Published private(set) var sessionUploadedBytes: UInt64 = 0
     @Published private(set) var lifetimeDownloadedBytes: UInt64 = 0
@@ -179,7 +177,6 @@ final class ContentViewVM: ObservableObject {
         let serverState: ProxyServerState
         let endpointDisplay: String
         let connections: [TrackedConnection]
-        let totalConnectionAttempts: Int
         let sessionDownloadedBytes: UInt64
         let sessionUploadedBytes: UInt64
         let lifetimeDownloadedBytes: UInt64
@@ -200,8 +197,6 @@ final class ContentViewVM: ObservableObject {
         serverState = previewState.serverState
         endpointDisplay = previewState.endpointDisplay
         connections = previewState.connections
-        activeConnectionCount = previewState.connections.lazy.filter { $0.state == .open }.count
-        totalConnectionAttempts = previewState.totalConnectionAttempts
         sessionDownloadedBytes = previewState.sessionDownloadedBytes
         sessionUploadedBytes = previewState.sessionUploadedBytes
         lifetimeDownloadedBytes = previewState.lifetimeDownloadedBytes
@@ -233,6 +228,21 @@ final class ContentViewVM: ObservableObject {
 
     var lifetimeUploadedDisplay: String {
         Self.byteCountString(lifetimeUploadedBytes)
+    }
+
+    var openConnectionCount: Int {
+        connections.lazy.filter { $0.state == .open }.count
+    }
+
+    var connectionsPanelTitle: String {
+        switch openConnectionCount {
+        case 0:
+            return "Connections"
+        case 1:
+            return "1 Connection"
+        default:
+            return "\(openConnectionCount) Connections"
+        }
     }
 
     func setInterfaceUnavailable() {
@@ -305,7 +315,6 @@ final class ContentViewVM: ObservableObject {
             )
             connectionsByID[id] = connection
             connectionOrder.insert(id, at: 0)
-            totalConnectionAttempts += 1
         }
 
         trimEndedConnections()
@@ -366,7 +375,6 @@ final class ContentViewVM: ObservableObject {
 
     private func publishConnections() {
         connections = connectionOrder.compactMap { connectionsByID[$0] }
-        activeConnectionCount = connections.lazy.filter { $0.state == .open }.count
     }
 
     private func startTransferPolling() {
@@ -560,7 +568,6 @@ extension ContentViewVM {
                 serverState: .running,
                 endpointDisplay: "10.13.37.2:4884",
                 connections: connections,
-                totalConnectionAttempts: connections.count,
                 sessionDownloadedBytes: 842_000_000,
                 sessionUploadedBytes: 131_000_000,
                 lifetimeDownloadedBytes: 12_400_000_000,
