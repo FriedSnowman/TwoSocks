@@ -109,7 +109,7 @@ struct ContentView: View {
             )
 
             MetricCard(
-                title: "Connections",
+                title: "Attempts",
                 value: "\(viewModel.runtimeStats.totalConnectionAttempts)",
                 symbol: "bolt.horizontal.circle.fill",
                 tint: .green
