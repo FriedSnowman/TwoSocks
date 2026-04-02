@@ -70,6 +70,9 @@ static const char* auth_pass;
 static sblist* auth_ips;
 static pthread_rwlock_t auth_ips_lock = PTHREAD_RWLOCK_INITIALIZER;
 static const struct server* server;
+static pthread_mutex_t connection_event_lock = PTHREAD_MUTEX_INITIALIZER;
+static twosocks_connection_event_handler connection_event_handler;
+static int64_t next_connection_identifier_value = 1;
 
 struct thread {
     pthread_t pt;
@@ -101,6 +104,54 @@ struct socks5_addrport {
     char addr[MAX_DNS_LEN + 1];
     unsigned short port;
 };
+
+void twosocks_set_connection_event_handler(twosocks_connection_event_handler handler) {
+    pthread_mutex_lock(&connection_event_lock);
+    connection_event_handler = handler;
+    pthread_mutex_unlock(&connection_event_lock);
+}
+
+static int64_t next_connection_identifier(void) {
+    int64_t identifier;
+    pthread_mutex_lock(&connection_event_lock);
+    identifier = next_connection_identifier_value++;
+    pthread_mutex_unlock(&connection_event_lock);
+    return identifier;
+}
+
+static twosocks_connection_event_handler current_connection_event_handler(void) {
+    twosocks_connection_event_handler handler;
+    pthread_mutex_lock(&connection_event_lock);
+    handler = connection_event_handler;
+    pthread_mutex_unlock(&connection_event_lock);
+    return handler;
+}
+
+static void emit_connection_event(
+    int64_t identifier,
+    enum twosocks_connection_protocol protocol,
+    enum twosocks_connection_state state,
+    const char* host,
+    unsigned short port,
+    enum errorcode error_code
+) {
+    twosocks_connection_event_handler handler = current_connection_event_handler();
+    if(handler) {
+        handler(identifier, protocol, state, host, port, error_code);
+    }
+}
+
+static void emit_addrport_connection_event(
+    int64_t identifier,
+    enum twosocks_connection_protocol protocol,
+    enum twosocks_connection_state state,
+    const struct socks5_addrport* addrport,
+    enum errorcode error_code
+) {
+    if(addrport) {
+        emit_connection_event(identifier, protocol, state, addrport->addr, addrport->port, error_code);
+    }
+}
 
 
 int compareSocks5Addrport(const struct socks5_addrport* addrport1, const struct socks5_addrport* addrport2) {
@@ -168,7 +219,8 @@ static int parse_socks_request_header(
     unsigned char *buf,
     size_t n,
     int* cmd,
-    union sockaddr_union* svc_addr
+    union sockaddr_union* svc_addr,
+    struct socks5_addrport* requested_addr
 ) {
     assert(svc_addr != NULL);
     if(n < 3) return -EC_GENERAL_FAILURE;
@@ -181,6 +233,9 @@ static int parse_socks_request_header(
     int ret = parse_addrport(buf + 3, n - 3, &addrport);
     if (ret < 0) {
         return ret;
+    }
+    if(requested_addr) {
+        *requested_addr = addrport;
     }
     int socktype = *cmd == CONNECT? TCP_SOCKET : UDP_SOCKET;
     ret = resolveSocks5Addrport(&addrport, socktype, svc_addr);
@@ -319,7 +374,7 @@ static void send_error(int fd, enum errorcode ec) {
     write(fd, buf, 10);
 }
 
-static void copyloop(int fd1, int fd2) {
+static enum twosocks_connection_state copyloop(int fd1, int fd2) {
     struct pollfd fds[2] = {
         [0] = {.fd = fd1, .events = POLLIN},
         [1] = {.fd = fd2, .events = POLLIN},
@@ -331,20 +386,21 @@ static void copyloop(int fd1, int fd2) {
            when a connection is really unused. */
         switch(poll(fds, 2, 60*15*1000)) {
             case 0:
-                return;
+                return TWOSOCKS_CONNECTION_CLOSED;
             case -1:
                 if(errno == EINTR || errno == EAGAIN) continue;
                 else perror("poll");
-                return;
+                return TWOSOCKS_CONNECTION_ERROR;
         }
         int infd = (fds[0].revents & POLLIN) ? fd1 : fd2;
         int outfd = infd == fd2 ? fd1 : fd2;
         char buf[1024];
         ssize_t sent = 0, n = read(infd, buf, sizeof buf);
-        if(n <= 0) return;
+        if(n == 0) return TWOSOCKS_CONNECTION_CLOSED;
+        if(n < 0) return TWOSOCKS_CONNECTION_ERROR;
         while(sent < n) {
             ssize_t m = write(outfd, buf+sent, n-sent);
-            if(m < 0) return;
+            if(m < 0) return TWOSOCKS_CONNECTION_ERROR;
             sent += m;
         }
     }
@@ -369,6 +425,7 @@ static ssize_t extract_udp_data(unsigned char* buf, ssize_t n, struct socks5_add
 
 struct fd_socks5addr {
     int fd;
+    int64_t connection_id;
     struct socks5_addrport addrport;
 };
 
@@ -408,6 +465,9 @@ static void copy_loop_udp(int tcp_fd, int udp_fd) {
     ssize_t n, ret;
     struct fd_socks5addr item;
     sblist* sock_list = sblist_new(sizeof(struct fd_socks5addr), 1);
+    int association_failed = 0;
+    int64_t failed_connection_id = 0;
+    enum errorcode failed_error_code = EC_GENERAL_FAILURE;
     while(1) {
         switch(poll(fds, poll_fds, 60*15*1000)) {
             case 0:
@@ -415,6 +475,7 @@ static void copy_loop_udp(int tcp_fd, int udp_fd) {
             case -1:
                 if(errno == EINTR || errno == EAGAIN) continue;
                 else perror("poll");
+                association_failed = 1;
                 goto UDP_LOOP_END;
         }
 
@@ -430,10 +491,13 @@ static void copy_loop_udp(int tcp_fd, int udp_fd) {
             if (n == -1) {
                 if(errno == EINTR || errno == EAGAIN) continue;
                 else perror("read from tcp socket");
+                association_failed = 1;
                 goto UDP_LOOP_END;
             }
             buf[n - 1] = '\0';
             dprintf(1, "received unexpectedly from TCP socket in UDP associate: %s", buf);
+            association_failed = 1;
+            goto UDP_LOOP_END;
         }
 
         // client UDP socket
@@ -447,11 +511,13 @@ static void copy_loop_udp(int tcp_fd, int udp_fd) {
             if (n == -1) {
                 if(errno == EINTR || errno == EAGAIN) continue;
                 perror("recv from udp socket");
+                association_failed = 1;
                 goto UDP_LOOP_END;
             }
             if (!udp_is_bound) {
                 if (connect(udp_fd, (const struct sockaddr*)&client_addr, socklen)) {
                     perror("connect");
+                    association_failed = 1;
                     goto UDP_LOOP_END;
                 }
                 udp_is_bound = 1;
@@ -461,37 +527,112 @@ static void copy_loop_udp(int tcp_fd, int udp_fd) {
             ssize_t offset = extract_udp_data(buf, n, &item.addrport);
             if (offset < 0) {
                 dprintf(2, "failed to extract from udp packet %ld", offset);
+                association_failed = 1;
                 goto UDP_LOOP_END;
             }
 
             int send_fd = 0;
+            int64_t send_connection_id = 0;
             int idx = sblist_search(sock_list, (char*)&item, compare_fd_socks5addr_by_addrport);
             if (idx != -1) {
                 struct fd_socks5addr* item_found = (struct fd_socks5addr*)sblist_item_from_index(sock_list, idx);
                 send_fd = item_found->fd;
+                send_connection_id = item_found->connection_id;
             } else {
                 union sockaddr_union target_addr;
                 ret = resolveSocks5Addrport(&item.addrport, UDP_SOCKET, &target_addr);
                 if (ret < 0) {
                     dprintf(2, "failed to resolve socks5 addrport, %ld", ret);
+                    failed_connection_id = next_connection_identifier();
+                    failed_error_code = ret * -1;
+                    emit_addrport_connection_event(
+                        failed_connection_id,
+                        TWOSOCKS_CONNECTION_PROTOCOL_UDP,
+                        TWOSOCKS_CONNECTION_ERROR,
+                        &item.addrport,
+                        failed_error_code
+                    );
+                    association_failed = 1;
                     goto UDP_LOOP_END;
                 }
 
                 // create a new socket
                 int fd = socket(SOCKADDR_UNION_AF(&target_addr), SOCK_DGRAM, 0);
+                if(fd == -1) {
+                    perror("socket");
+                    failed_connection_id = next_connection_identifier();
+                    failed_error_code = EC_GENERAL_FAILURE;
+                    emit_addrport_connection_event(
+                        failed_connection_id,
+                        TWOSOCKS_CONNECTION_PROTOCOL_UDP,
+                        TWOSOCKS_CONNECTION_ERROR,
+                        &item.addrport,
+                        failed_error_code
+                    );
+                    association_failed = 1;
+                    goto UDP_LOOP_END;
+                }
                 if (-1 == connect(fd, (const struct sockaddr*)&target_addr, ((const struct sockaddr*)&target_addr)->sa_len)) {
                     perror("connect");
                     send_error(tcp_fd, EC_GENERAL_FAILURE);
+                    close(fd);
+                    failed_connection_id = next_connection_identifier();
+                    failed_error_code = EC_GENERAL_FAILURE;
+                    emit_addrport_connection_event(
+                        failed_connection_id,
+                        TWOSOCKS_CONNECTION_PROTOCOL_UDP,
+                        TWOSOCKS_CONNECTION_ERROR,
+                        &item.addrport,
+                        failed_error_code
+                    );
+                    association_failed = 1;
                     goto UDP_LOOP_END;
                 }
                 item.fd = fd;
-                sblist_add(sock_list, &item);
+                item.connection_id = next_connection_identifier();
+                if(!sblist_add(sock_list, &item)) {
+                    close(fd);
+                    failed_connection_id = item.connection_id;
+                    failed_error_code = EC_GENERAL_FAILURE;
+                    emit_addrport_connection_event(
+                        item.connection_id,
+                        TWOSOCKS_CONNECTION_PROTOCOL_UDP,
+                        TWOSOCKS_CONNECTION_ERROR,
+                        &item.addrport,
+                        failed_error_code
+                    );
+                    association_failed = 1;
+                    goto UDP_LOOP_END;
+                }
 
                 // add to polling fds
+                if(poll_fds >= 1024) {
+                    close(fd);
+                    sblist_delete(sock_list, sblist_getsize(sock_list) - 1);
+                    failed_connection_id = item.connection_id;
+                    failed_error_code = EC_GENERAL_FAILURE;
+                    emit_addrport_connection_event(
+                        item.connection_id,
+                        TWOSOCKS_CONNECTION_PROTOCOL_UDP,
+                        TWOSOCKS_CONNECTION_ERROR,
+                        &item.addrport,
+                        failed_error_code
+                    );
+                    association_failed = 1;
+                    goto UDP_LOOP_END;
+                }
                 fds[poll_fds].fd = fd;
                 fds[poll_fds].events = POLL_IN;
                 poll_fds++;
                 send_fd = fd;
+                send_connection_id = item.connection_id;
+                emit_addrport_connection_event(
+                    item.connection_id,
+                    TWOSOCKS_CONNECTION_PROTOCOL_UDP,
+                    TWOSOCKS_CONNECTION_OPEN,
+                    &item.addrport,
+                    EC_SUCCESS
+                );
                 if (CONFIG_LOG) {
                         char targetname[256];
                         int af = SOCKADDR_UNION_AF(&target_addr);
@@ -505,6 +646,9 @@ static void copy_loop_udp(int tcp_fd, int udp_fd) {
             ssize_t ret = send(send_fd, buf + offset, n - offset, 0);
             if (ret < 0) {
                 perror("send");
+                association_failed = 1;
+                failed_connection_id = send_connection_id;
+                failed_error_code = EC_GENERAL_FAILURE;
                 goto UDP_LOOP_END;
             }
         }
@@ -555,17 +699,41 @@ static void copy_loop_udp(int tcp_fd, int udp_fd) {
                 n = recv(fds[i].fd, buf + offset, sizeof(buf) - offset, 0);
                 if(n <= 0) {
                     perror("recv from target address");
+                    association_failed = 1;
+                    failed_connection_id = item->connection_id;
+                    failed_error_code = EC_GENERAL_FAILURE;
                     goto UDP_LOOP_END;
                 }
                 ret = write(udp_fd, buf, offset + n);
                 if (ret < 0) {
                     perror("write to udp_fd");
+                    association_failed = 1;
+                    failed_connection_id = item->connection_id;
+                    failed_error_code = EC_GENERAL_FAILURE;
                     goto UDP_LOOP_END;
                 }
             }
         }
     }
 UDP_LOOP_END:
+    for (size_t i = 0; i < sblist_getsize(sock_list); i++) {
+        struct fd_socks5addr* tracked_item = (struct fd_socks5addr*)sblist_item_from_index(sock_list, i);
+        enum twosocks_connection_state final_state = TWOSOCKS_CONNECTION_CLOSED;
+        enum errorcode final_error = EC_SUCCESS;
+        if(association_failed) {
+            if(failed_connection_id == 0 || tracked_item->connection_id == failed_connection_id) {
+                final_state = TWOSOCKS_CONNECTION_ERROR;
+                final_error = failed_error_code;
+            }
+        }
+        emit_addrport_connection_event(
+            tracked_item->connection_id,
+            TWOSOCKS_CONNECTION_PROTOCOL_UDP,
+            final_state,
+            &tracked_item->addrport,
+            final_error
+        );
+    }
     for (int i = 2; i < poll_fds; i++)
         close(fds[i].fd);
     sblist_free(sock_list);
@@ -652,6 +820,7 @@ static void* clientthread(void *data) {
     // for CONNECT, this is target TCP address
     // for UDP ASSOCIATE, this is client UDP address
     union sockaddr_union address, local_addr;
+    struct socks5_addrport requested_addr;
 
     enum authmethod am;
     while((n = recv(t->client.fd, buf, sizeof buf, 0)) > 0) {
@@ -678,24 +847,63 @@ static void* clientthread(void *data) {
             case SS_3_AUTHED:
                 (void)0;
                 int cmd = 0;
-                ret = parse_socks_request_header(buf, n, &cmd, &address);
+                ret = parse_socks_request_header(buf, n, &cmd, &address, &requested_addr);
                 if (ret != EC_SUCCESS)
                     goto breakloop;
                 
                 if (cmd == CONNECT) {
+                    int64_t connection_id = next_connection_identifier();
                     ret = connect_socks_target(&address, &t->client);
                     if(ret < 0) {
+                        emit_addrport_connection_event(
+                            connection_id,
+                            TWOSOCKS_CONNECTION_PROTOCOL_TCP,
+                            TWOSOCKS_CONNECTION_ERROR,
+                            &requested_addr,
+                            ret * -1
+                        );
                         send_error(t->client.fd, ret*-1);
                         goto breakloop;
                     }
                     int remotefd = ret;
                     socklen_t len = sizeof(union sockaddr_union);
-                    if (getsockname(remotefd, (struct sockaddr*)&local_addr, &len)) goto breakloop;
-                    if (-1 == send_response(t->client.fd, EC_SUCCESS, &local_addr)) {
+                    if (getsockname(remotefd, (struct sockaddr*)&local_addr, &len)) {
+                        emit_addrport_connection_event(
+                            connection_id,
+                            TWOSOCKS_CONNECTION_PROTOCOL_TCP,
+                            TWOSOCKS_CONNECTION_ERROR,
+                            &requested_addr,
+                            EC_GENERAL_FAILURE
+                        );
                         close(remotefd);
                         goto breakloop;
                     }
-                    copyloop(t->client.fd, remotefd);
+                    if (-1 == send_response(t->client.fd, EC_SUCCESS, &local_addr)) {
+                        emit_addrport_connection_event(
+                            connection_id,
+                            TWOSOCKS_CONNECTION_PROTOCOL_TCP,
+                            TWOSOCKS_CONNECTION_ERROR,
+                            &requested_addr,
+                            EC_GENERAL_FAILURE
+                        );
+                        close(remotefd);
+                        goto breakloop;
+                    }
+                    emit_addrport_connection_event(
+                        connection_id,
+                        TWOSOCKS_CONNECTION_PROTOCOL_TCP,
+                        TWOSOCKS_CONNECTION_OPEN,
+                        &requested_addr,
+                        EC_SUCCESS
+                    );
+                    enum twosocks_connection_state final_state = copyloop(t->client.fd, remotefd);
+                    emit_addrport_connection_event(
+                        connection_id,
+                        TWOSOCKS_CONNECTION_PROTOCOL_TCP,
+                        final_state,
+                        &requested_addr,
+                        final_state == TWOSOCKS_CONNECTION_ERROR ? EC_GENERAL_FAILURE : EC_SUCCESS
+                    );
                     close(remotefd);
                     goto breakloop;
                 } else if (cmd == UDP_ASSOCIATE) {

@@ -4,6 +4,8 @@
 #undef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
 
+#include <stdint.h>
+
 enum socksstate {
     SS_1_CONNECTED,
     SS_2_NEED_AUTH, /* skipped if NO_AUTH method supported */
@@ -50,9 +52,30 @@ enum socks5_socket_type {
     UDP_SOCKET =2,
 };
 
+enum twosocks_connection_state {
+    TWOSOCKS_CONNECTION_OPEN = 0,
+    TWOSOCKS_CONNECTION_CLOSED = 1,
+    TWOSOCKS_CONNECTION_ERROR = 2,
+};
+
+enum twosocks_connection_protocol {
+    TWOSOCKS_CONNECTION_PROTOCOL_TCP = 0,
+    TWOSOCKS_CONNECTION_PROTOCOL_UDP = 1,
+};
+
+typedef void (*twosocks_connection_event_handler)(
+    int64_t identifier,
+    int32_t protocol,
+    int32_t state,
+    const char* host,
+    uint16_t port,
+    int32_t error_code
+);
+
 #define MAX_DNS_LEN    ((2 << 8) - 1)
 #define MAX_SOCKS5_HEADER_LEN (2 + 1 + 1 + 1 + MAX_DNS_LEN + 2)
 
 int socks_main(int argc, char** argv);
+void twosocks_set_connection_event_handler(twosocks_connection_event_handler handler);
 
 #endif

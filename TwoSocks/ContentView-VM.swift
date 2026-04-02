@@ -3,6 +3,7 @@ import Foundation
 import SwiftUI
 
 private let proxyPort = 4884
+private let maxEndedConnections = 100
 
 enum ProxyServerState: Equatable {
     case waitingForNetwork
@@ -63,16 +64,116 @@ enum ProxyServerState: Equatable {
     }
 }
 
+enum ProxyConnectionProtocol: Int32 {
+    case tcp = 0
+    case udp = 1
+
+    var title: String {
+        switch self {
+        case .tcp:
+            return "TCP"
+        case .udp:
+            return "UDP"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .tcp:
+            return "arrow.left.arrow.right.circle.fill"
+        case .udp:
+            return "dot.radiowaves.left.and.right"
+        }
+    }
+}
+
+enum ProxyConnectionState: Int32 {
+    case open = 0
+    case closed = 1
+    case error = 2
+
+    var title: String {
+        switch self {
+        case .open:
+            return "Open"
+        case .closed:
+            return "Closed"
+        case .error:
+            return "Error"
+        }
+    }
+
+    var tint: Color {
+        switch self {
+        case .open:
+            return .green
+        case .closed:
+            return .secondary
+        case .error:
+            return .red
+        }
+    }
+}
+
+struct TrackedConnection: Identifiable {
+    let id: Int64
+    var title: String
+    var protocolType: ProxyConnectionProtocol
+    var state: ProxyConnectionState
+    var updatedAt: Date
+    var errorCode: Int32?
+}
+
+private final class ConnectionEventBridge {
+    static weak var receiver: ContentViewVM?
+}
+
+@_cdecl("twosocks_connection_event_bridge")
+func twosocks_connection_event_bridge(
+    _ identifier: Int64,
+    _ protocolRaw: Int32,
+    _ stateRaw: Int32,
+    _ host: UnsafePointer<CChar>?,
+    _ port: UInt16,
+    _ errorCode: Int32
+) {
+    let endpointHost = host.map { String(cString: $0) } ?? ""
+
+    Task { @MainActor in
+        ConnectionEventBridge.receiver?.handleConnectionEvent(
+            id: identifier,
+            protocolRaw: protocolRaw,
+            stateRaw: stateRaw,
+            host: endpointHost,
+            port: port,
+            errorCode: errorCode
+        )
+    }
+}
+
 @MainActor
-class ContentViewVM: ObservableObject {
+final class ContentViewVM: ObservableObject {
     @Published private(set) var serverState: ProxyServerState = .starting
     @Published private(set) var endpointDisplay = "Detecting local IP"
+    @Published private(set) var connections: [TrackedConnection] = []
+    @Published private(set) var activeConnectionCount = 0
+    @Published private(set) var totalConnectionAttempts = 0
 
     private var audioPlayer: AVAudioPlayer?
     private var hasStartedProxy = false
+    private var connectionsByID: [Int64: TrackedConnection] = [:]
+    private var connectionOrder: [Int64] = []
 
     init() {
+        ConnectionEventBridge.receiver = self
+        twosocks_set_connection_event_handler(twosocks_connection_event_bridge)
         setupBackgroundAudio()
+    }
+
+    deinit {
+        if ConnectionEventBridge.receiver === self {
+            ConnectionEventBridge.receiver = nil
+        }
     }
 
     func setInterfaceUnavailable() {
@@ -108,6 +209,62 @@ class ContentViewVM: ObservableObject {
         }
     }
 
+    fileprivate func handleConnectionEvent(
+        id: Int64,
+        protocolRaw: Int32,
+        stateRaw: Int32,
+        host: String,
+        port: UInt16,
+        errorCode: Int32
+    ) {
+        guard
+            let protocolType = ProxyConnectionProtocol(rawValue: protocolRaw),
+            let state = ProxyConnectionState(rawValue: stateRaw)
+        else {
+            return
+        }
+
+        let title = Self.connectionTitle(host: host, port: port)
+        let now = Date()
+
+        if var existing = connectionsByID[id] {
+            existing.title = title
+            existing.protocolType = protocolType
+            existing.state = state
+            existing.updatedAt = now
+            existing.errorCode = state == .error ? errorCode : nil
+            connectionsByID[id] = existing
+            moveConnectionToFront(id)
+        } else {
+            let connection = TrackedConnection(
+                id: id,
+                title: title,
+                protocolType: protocolType,
+                state: state,
+                updatedAt: now,
+                errorCode: state == .error ? errorCode : nil
+            )
+            connectionsByID[id] = connection
+            connectionOrder.insert(id, at: 0)
+            totalConnectionAttempts += 1
+        }
+
+        trimEndedConnections()
+        publishConnections()
+    }
+
+    func statusDetail(for connection: TrackedConnection) -> String {
+        let timestamp = connection.updatedAt.formatted(date: .omitted, time: .standard)
+        switch connection.state {
+        case .open:
+            return "\(connection.protocolType.title) • Live as of \(timestamp)"
+        case .closed:
+            return "\(connection.protocolType.title) • Closed at \(timestamp)"
+        case .error:
+            return "\(connection.protocolType.title) • \(errorDescription(for: connection.errorCode))"
+        }
+    }
+
     private func markServerRunning() {
         if serverState != .running {
             serverState = .running
@@ -118,6 +275,75 @@ class ContentViewVM: ObservableObject {
         let failedState = ProxyServerState.failed(code)
         if serverState != failedState {
             serverState = failedState
+        }
+    }
+
+    private func moveConnectionToFront(_ id: Int64) {
+        connectionOrder.removeAll(where: { $0 == id })
+        connectionOrder.insert(id, at: 0)
+    }
+
+    private func trimEndedConnections() {
+        var endedCount = 0
+        var idsToRemove = Set<Int64>()
+
+        for id in connectionOrder.reversed() {
+            guard let connection = connectionsByID[id] else { continue }
+            guard connection.state != .open else { continue }
+
+            endedCount += 1
+            if endedCount > maxEndedConnections {
+                idsToRemove.insert(id)
+            }
+        }
+
+        guard !idsToRemove.isEmpty else { return }
+
+        for id in idsToRemove {
+            connectionsByID.removeValue(forKey: id)
+        }
+        connectionOrder.removeAll(where: idsToRemove.contains)
+    }
+
+    private func publishConnections() {
+        connections = connectionOrder.compactMap { connectionsByID[$0] }
+        activeConnectionCount = connections.lazy.filter { $0.state == .open }.count
+    }
+
+    private static func connectionTitle(host: String, port: UInt16) -> String {
+        let normalizedHost = normalizedHostDisplay(host)
+        return "\(normalizedHost):\(port)"
+    }
+
+    private static func normalizedHostDisplay(_ host: String) -> String {
+        guard !host.isEmpty else { return "unknown" }
+        guard host.contains(":") else { return host }
+        guard !host.hasPrefix("[") && !host.hasSuffix("]") else { return host }
+        return "[\(host)]"
+    }
+
+    private func errorDescription(for errorCode: Int32?) -> String {
+        switch errorCode {
+        case .some(3):
+            return "Network unreachable"
+        case .some(4):
+            return "Host unreachable"
+        case .some(5):
+            return "Connection refused"
+        case .some(6):
+            return "Connection timed out"
+        case .some(7):
+            return "Command not supported"
+        case .some(8):
+            return "Address type not supported"
+        case .some(9):
+            return "Bind address unavailable"
+        case .some(1):
+            return "General failure"
+        case .some(let code):
+            return "Error \(code)"
+        case .none:
+            return "General failure"
         }
     }
 

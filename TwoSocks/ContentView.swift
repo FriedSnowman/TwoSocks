@@ -80,6 +80,10 @@ struct ContentView: View {
                     .lineLimit(1)
                     .minimumScaleFactor(0.8)
                     .textSelection(.enabled)
+
+                Text(viewModel.serverState.detail)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
             }
         }
         .fixedSize(horizontal: false, vertical: true)
@@ -103,14 +107,14 @@ struct ContentView: View {
 
             MetricCard(
                 title: "Active Clients",
-                value: "--",
+                value: "\(viewModel.activeConnectionCount)",
                 symbol: "person.2.fill",
                 tint: .indigo
             )
 
             MetricCard(
                 title: "Attempts",
-                value: "--",
+                value: "\(viewModel.totalConnectionAttempts)",
                 symbol: "bolt.horizontal.circle.fill",
                 tint: .green
             )
@@ -121,13 +125,32 @@ struct ContentView: View {
         DashboardPanel(
             title: "Connections"
         ) {
-            ContentUnavailableView {
-                Label("Monitoring removed", systemImage: "network")
-            } description: {
-                Text("Live connection monitoring is disabled.")
+            if viewModel.connections.isEmpty {
+                ContentUnavailableView {
+                    Label("No connections yet", systemImage: "network")
+                } description: {
+                    Text("Open traffic through the proxy to see live status here.")
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .padding(.horizontal, 12)
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        ForEach(viewModel.connections) { connection in
+                            ConnectionRowView(
+                                connection: connection,
+                                detail: viewModel.statusDetail(for: connection)
+                            )
+
+                            if connection.id != viewModel.connections.last?.id {
+                                Divider()
+                                    .padding(.leading, 52)
+                            }
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .padding(.horizontal, 12)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -195,6 +218,55 @@ private struct MetricCard: View {
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
         }
+    }
+}
+
+private struct ConnectionRowView: View {
+    let connection: TrackedConnection
+    let detail: String
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: connection.protocolType.systemImage)
+                .font(.headline)
+                .foregroundStyle(connection.state.tint)
+                .frame(width: 24, height: 24)
+                .padding(.top, 2)
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text(connection.title)
+                    .font(.subheadline.monospaced())
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+                    .textSelection(.enabled)
+
+                Text(detail)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+
+            Spacer(minLength: 12)
+
+            ConnectionStateBadge(state: connection.state)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
+    }
+}
+
+private struct ConnectionStateBadge: View {
+    let state: ProxyConnectionState
+
+    var body: some View {
+        Text(state.title)
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(state.tint)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(state.tint.opacity(0.14), in: Capsule())
     }
 }
 
