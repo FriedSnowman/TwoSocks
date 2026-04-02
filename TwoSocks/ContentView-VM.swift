@@ -3,7 +3,7 @@ import Foundation
 import SwiftUI
 
 private let proxyPort = 4884
-private let maxEndedConnections = 100
+private let maxRetainedEndedConnections = 100
 private let transferPollInterval: TimeInterval = 0.5
 private let lifetimeDownloadedBytesKey = "lifetimeDownloadedBytes"
 private let lifetimeUploadedBytesKey = "lifetimeUploadedBytes"
@@ -234,6 +234,14 @@ final class ContentViewVM: ObservableObject {
         connections.lazy.filter { $0.state == .open }.count
     }
 
+    var liveConnections: [TrackedConnection] {
+        connections.filter { $0.state == .open }
+    }
+
+    var recentConnections: [TrackedConnection] {
+        connections.filter { $0.state != .open }
+    }
+
     var connectionsPanelTitle: String {
         switch openConnectionCount {
         case 0:
@@ -325,7 +333,7 @@ final class ContentViewVM: ObservableObject {
         let timestamp = connection.updatedAt.formatted(date: .omitted, time: .standard)
         switch connection.state {
         case .open:
-            return "\(connection.protocolType.title) • Live as of \(timestamp)"
+            return "\(connection.protocolType.title) • Open as of \(timestamp)"
         case .closed:
             return "\(connection.protocolType.title) • Closed at \(timestamp)"
         case .error:
@@ -360,7 +368,7 @@ final class ContentViewVM: ObservableObject {
             guard connection.state != .open else { continue }
 
             endedCount += 1
-            if endedCount > maxEndedConnections {
+            if endedCount > maxRetainedEndedConnections {
                 idsToRemove.insert(id)
             }
         }
@@ -374,7 +382,10 @@ final class ContentViewVM: ObservableObject {
     }
 
     private func publishConnections() {
-        connections = connectionOrder.compactMap { connectionsByID[$0] }
+        let orderedConnections = connectionOrder.compactMap { connectionsByID[$0] }
+        let liveConnections = orderedConnections.filter { $0.state == .open }
+        let endedConnections = orderedConnections.filter { $0.state != .open }
+        connections = liveConnections + endedConnections
     }
 
     private func startTransferPolling() {

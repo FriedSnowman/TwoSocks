@@ -138,25 +138,30 @@ struct ContentView: View {
                 ContentUnavailableView {
                     Label("No connections yet", systemImage: "network")
                 } description: {
-                    Text("Open traffic through the proxy to see live status here.")
+                    Text("Open traffic through the proxy to see status here.")
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .padding(.horizontal, 12)
             } else {
                 ScrollView {
-                    LazyVStack(spacing: 0) {
-                        ForEach(viewModel.connections) { connection in
-                            ConnectionRowView(
-                                connection: connection,
-                                detail: viewModel.statusDetail(for: connection)
+                    LazyVStack(alignment: .leading, spacing: 12) {
+                        if !viewModel.liveConnections.isEmpty {
+                            ConnectionsSectionView(
+                                title: "Open",
+                                connections: viewModel.liveConnections,
+                                detailProvider: viewModel.statusDetail(for:)
                             )
+                        }
 
-                            if connection.id != viewModel.connections.last?.id {
-                                Divider()
-                                    .padding(.leading, 52)
-                            }
+                        if !viewModel.recentConnections.isEmpty {
+                            ConnectionsSectionView(
+                                title: viewModel.liveConnections.isEmpty ? "Recent" : "Recent Activity",
+                                connections: viewModel.recentConnections,
+                                detailProvider: viewModel.statusDetail(for:)
+                            )
                         }
                     }
+                    .padding(12)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             }
@@ -304,6 +309,39 @@ private struct ConnectionStateBadge: View {
             .padding(.horizontal, 10)
             .padding(.vertical, 5)
             .background(state.tint.opacity(0.14), in: Capsule())
+    }
+}
+
+private struct ConnectionsSectionView: View {
+    let title: String
+    let connections: [TrackedConnection]
+    let detailProvider: (TrackedConnection) -> String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text(title)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .textCase(.uppercase)
+                .padding(.horizontal, 2)
+                .padding(.bottom, 6)
+
+            CardSurface {
+                VStack(spacing: 0) {
+                    ForEach(connections) { connection in
+                        ConnectionRowView(
+                            connection: connection,
+                            detail: detailProvider(connection)
+                        )
+
+                        if connection.id != connections.last?.id {
+                            Divider()
+                                .padding(.leading, 52)
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
