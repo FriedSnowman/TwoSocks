@@ -174,6 +174,19 @@ final class ContentViewVM: ObservableObject {
     private var lastNativeDownloadedBytes: UInt64 = 0
     private var lastNativeUploadedBytes: UInt64 = 0
 
+    #if DEBUG
+    struct PreviewState {
+        let serverState: ProxyServerState
+        let endpointDisplay: String
+        let connections: [TrackedConnection]
+        let totalConnectionAttempts: Int
+        let sessionDownloadedBytes: UInt64
+        let sessionUploadedBytes: UInt64
+        let lifetimeDownloadedBytes: UInt64
+        let lifetimeUploadedBytes: UInt64
+    }
+    #endif
+
     init() {
         loadLifetimeTransferTotals()
         ConnectionEventBridge.receiver = self
@@ -181,6 +194,22 @@ final class ContentViewVM: ObservableObject {
         setupBackgroundAudio()
         startTransferPolling()
     }
+
+    #if DEBUG
+    init(previewState: PreviewState) {
+        serverState = previewState.serverState
+        endpointDisplay = previewState.endpointDisplay
+        connections = previewState.connections
+        activeConnectionCount = previewState.connections.lazy.filter { $0.state == .open }.count
+        totalConnectionAttempts = previewState.totalConnectionAttempts
+        sessionDownloadedBytes = previewState.sessionDownloadedBytes
+        sessionUploadedBytes = previewState.sessionUploadedBytes
+        lifetimeDownloadedBytes = previewState.lifetimeDownloadedBytes
+        lifetimeUploadedBytes = previewState.lifetimeUploadedBytes
+        connectionsByID = Dictionary(uniqueKeysWithValues: previewState.connections.map { ($0.id, $0) })
+        connectionOrder = previewState.connections.map(\.id)
+    }
+    #endif
 
     deinit {
         transferTimer?.invalidate()
@@ -471,6 +500,76 @@ private extension ContentViewVM {
         return formatter
     }()
 }
+
+#if DEBUG
+extension ContentViewVM {
+    static func previewDashboard(now: Date = .now) -> ContentViewVM {
+        let connections = [
+            TrackedConnection(
+                id: 1,
+                title: "api.supreme-cat.biz:443",
+                protocolType: .tcp,
+                state: .open,
+                updatedAt: now,
+                errorCode: nil
+            ),
+            TrackedConnection(
+                id: 2,
+                title: "8.8.8.8:53",
+                protocolType: .udp,
+                state: .open,
+                updatedAt: now.addingTimeInterval(-8),
+                errorCode: nil
+            ),
+            TrackedConnection(
+                id: 3,
+                title: "cdn.mystery-meat.invalid:80",
+                protocolType: .tcp,
+                state: .closed,
+                updatedAt: now.addingTimeInterval(-42),
+                errorCode: nil
+            ),
+            TrackedConnection(
+                id: 4,
+                title: "239.255.255.250:1900",
+                protocolType: .udp,
+                state: .closed,
+                updatedAt: now.addingTimeInterval(-73),
+                errorCode: nil
+            ),
+            TrackedConnection(
+                id: 5,
+                title: "bank-of-lizards.example:22",
+                protocolType: .tcp,
+                state: .error,
+                updatedAt: now.addingTimeInterval(-96),
+                errorCode: 5
+            ),
+            TrackedConnection(
+                id: 6,
+                title: "[2606:4700:4700::1111]:53",
+                protocolType: .udp,
+                state: .error,
+                updatedAt: now.addingTimeInterval(-140),
+                errorCode: 3
+            )
+        ]
+
+        return ContentViewVM(
+            previewState: PreviewState(
+                serverState: .running,
+                endpointDisplay: "10.13.37.2:4884",
+                connections: connections,
+                totalConnectionAttempts: connections.count,
+                sessionDownloadedBytes: 842_000_000,
+                sessionUploadedBytes: 131_000_000,
+                lifetimeDownloadedBytes: 12_400_000_000,
+                lifetimeUploadedBytes: 3_800_000_000
+            )
+        )
+    }
+}
+#endif
 
 private extension AVAudioPlayer {
     func configure(_ configuration: (AVAudioPlayer) -> Void) {

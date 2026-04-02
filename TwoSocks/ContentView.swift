@@ -41,12 +41,25 @@ class AppDelegate: NSObject, UIApplicationDelegate {
 }
 
 struct ContentView: View {
-    @StateObject private var viewModel = ContentViewVM()
+    @StateObject private var viewModel: ContentViewVM
+    private let startsProxyOnAppear: Bool
 
     private let metricColumns = [
         GridItem(.flexible(), spacing: 10),
         GridItem(.flexible(), spacing: 10)
     ]
+
+    @MainActor
+    init() {
+        _viewModel = StateObject(wrappedValue: ContentViewVM())
+        startsProxyOnAppear = true
+    }
+
+    @MainActor
+    init(viewModel: ContentViewVM, startsProxyOnAppear: Bool = true) {
+        _viewModel = StateObject(wrappedValue: viewModel)
+        self.startsProxyOnAppear = startsProxyOnAppear
+    }
 
     var body: some View {
         VStack(spacing: 10) {
@@ -59,7 +72,10 @@ struct ContentView: View {
         .padding(.bottom, 6)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .background(Color(uiColor: .systemGroupedBackground).ignoresSafeArea())
-        .onAppear(perform: startProxyIfPossible)
+        .onAppear {
+            guard startsProxyOnAppear else { return }
+            startProxyIfPossible()
+        }
     }
 
     private var headerRow: some View {
@@ -353,3 +369,12 @@ private struct CardSurface<Content: View>: View {
             .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
     }
 }
+
+#if DEBUG
+#Preview("Dashboard") {
+    ContentView(
+        viewModel: ContentViewVM.previewDashboard(),
+        startsProxyOnAppear: false
+    )
+}
+#endif
