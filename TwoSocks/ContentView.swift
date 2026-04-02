@@ -74,16 +74,19 @@ struct ContentView: View {
                         .font(.headline)
                 }
 
-                Text(viewModel.endpointDisplay)
-                    .font(.subheadline.monospaced())
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.8)
-                    .textSelection(.enabled)
-
-                Text(viewModel.serverState.detail)
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
+                if viewModel.serverState == .running {
+                    Text(viewModel.endpointDisplay)
+                        .font(.subheadline.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                        .textSelection(.enabled)
+                } else {
+                    Text(viewModel.serverState.detail)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                }
             }
         }
         .fixedSize(horizontal: false, vertical: true)
@@ -93,16 +96,20 @@ struct ContentView: View {
         LazyVGrid(columns: metricColumns, spacing: 10) {
             MetricCard(
                 title: "Downloaded",
-                value: "--",
+                value: viewModel.downloadedDisplay,
                 symbol: "arrow.down.circle.fill",
-                tint: .blue
+                tint: .blue,
+                secondaryTitle: "Total",
+                secondaryValue: viewModel.lifetimeDownloadedDisplay
             )
 
             MetricCard(
                 title: "Uploaded",
-                value: "--",
+                value: viewModel.uploadedDisplay,
                 symbol: "arrow.up.circle.fill",
-                tint: .orange
+                tint: .orange,
+                secondaryTitle: "Total",
+                secondaryValue: viewModel.lifetimeUploadedDisplay
             )
 
             MetricCard(
@@ -193,6 +200,8 @@ private struct MetricCard: View {
     let value: String
     let symbol: String
     let tint: Color
+    var secondaryTitle: String?
+    var secondaryValue: String?
 
     var body: some View {
         CardSurface {
@@ -208,11 +217,37 @@ private struct MetricCard: View {
                         .foregroundStyle(.secondary)
                 }
 
-                Text(value)
-                    .font(.title3.weight(.semibold))
-                    .monospacedDigit()
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.8)
+                if let secondaryTitle, let secondaryValue {
+                    HStack(alignment: .center, spacing: 10) {
+                        Text(value)
+                            .font(.title3.weight(.semibold))
+                            .foregroundStyle(.primary)
+                            .monospacedDigit()
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.7)
+
+                        Spacer(minLength: 8)
+
+                        VStack(alignment: .trailing, spacing: 2) {
+                            Text(secondaryTitle)
+                                .font(.caption2.weight(.medium))
+                                .foregroundStyle(.secondary)
+
+                            Text(secondaryValue)
+                                .font(.footnote.weight(.semibold))
+                                .foregroundStyle(.primary)
+                                .monospacedDigit()
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.7)
+                        }
+                    }
+                } else {
+                    Text(value)
+                        .font(.title3.weight(.semibold))
+                        .monospacedDigit()
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 14)

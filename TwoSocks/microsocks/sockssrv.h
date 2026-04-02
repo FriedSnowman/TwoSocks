@@ -77,5 +77,7 @@ typedef void (*twosocks_connection_event_handler)(
 
 int socks_main(int argc, char** argv);
 void twosocks_set_connection_event_handler(twosocks_connection_event_handler handler);
+uint64_t twosocks_total_downloaded_bytes(void);
+uint64_t twosocks_total_uploaded_bytes(void);
 
 #endif

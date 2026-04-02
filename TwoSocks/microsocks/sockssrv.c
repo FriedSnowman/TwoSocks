@@ -71,8 +71,11 @@ static sblist* auth_ips;
 static pthread_rwlock_t auth_ips_lock = PTHREAD_RWLOCK_INITIALIZER;
 static const struct server* server;
 static pthread_mutex_t connection_event_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t transfer_totals_lock = PTHREAD_MUTEX_INITIALIZER;
 static twosocks_connection_event_handler connection_event_handler;
 static int64_t next_connection_identifier_value = 1;
+static uint64_t total_downloaded_bytes = 0;
+static uint64_t total_uploaded_bytes = 0;
 
 struct thread {
     pthread_t pt;
@@ -109,6 +112,34 @@ void twosocks_set_connection_event_handler(twosocks_connection_event_handler han
     pthread_mutex_lock(&connection_event_lock);
     connection_event_handler = handler;
     pthread_mutex_unlock(&connection_event_lock);
+}
+
+static void record_downloaded_bytes(size_t count) {
+    pthread_mutex_lock(&transfer_totals_lock);
+    total_downloaded_bytes += (uint64_t)count;
+    pthread_mutex_unlock(&transfer_totals_lock);
+}
+
+static void record_uploaded_bytes(size_t count) {
+    pthread_mutex_lock(&transfer_totals_lock);
+    total_uploaded_bytes += (uint64_t)count;
+    pthread_mutex_unlock(&transfer_totals_lock);
+}
+
+uint64_t twosocks_total_downloaded_bytes(void) {
+    uint64_t count;
+    pthread_mutex_lock(&transfer_totals_lock);
+    count = total_downloaded_bytes;
+    pthread_mutex_unlock(&transfer_totals_lock);
+    return count;
+}
+
+uint64_t twosocks_total_uploaded_bytes(void) {
+    uint64_t count;
+    pthread_mutex_lock(&transfer_totals_lock);
+    count = total_uploaded_bytes;
+    pthread_mutex_unlock(&transfer_totals_lock);
+    return count;
 }
 
 static int64_t next_connection_identifier(void) {
@@ -439,6 +470,11 @@ static enum twosocks_connection_state copyloop(int fd1, int fd2) {
             if(m < 0) return TWOSOCKS_CONNECTION_ERROR;
             sent += m;
         }
+        if(infd == fd1) {
+            record_uploaded_bytes((size_t)n);
+        } else {
+            record_downloaded_bytes((size_t)n);
+        }
     }
 }
 
@@ -687,6 +723,7 @@ static void copy_loop_udp(int tcp_fd, int udp_fd) {
                 failed_error_code = EC_GENERAL_FAILURE;
                 goto UDP_LOOP_END;
             }
+            record_uploaded_bytes((size_t)ret);
         }
 
         // UDP sockets for target addresses
@@ -748,6 +785,7 @@ static void copy_loop_udp(int tcp_fd, int udp_fd) {
                     failed_error_code = EC_GENERAL_FAILURE;
                     goto UDP_LOOP_END;
                 }
+                record_downloaded_bytes((size_t)n);
             }
         }
     }

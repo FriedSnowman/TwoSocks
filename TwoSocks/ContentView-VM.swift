@@ -4,6 +4,9 @@ import SwiftUI
 
 private let proxyPort = 4884
 private let maxEndedConnections = 100
+private let transferPollInterval: TimeInterval = 0.5
+private let lifetimeDownloadedBytesKey = "lifetimeDownloadedBytes"
+private let lifetimeUploadedBytesKey = "lifetimeUploadedBytes"
 
 enum ProxyServerState: Equatable {
     case waitingForNetwork
@@ -158,22 +161,49 @@ final class ContentViewVM: ObservableObject {
     @Published private(set) var connections: [TrackedConnection] = []
     @Published private(set) var activeConnectionCount = 0
     @Published private(set) var totalConnectionAttempts = 0
+    @Published private(set) var sessionDownloadedBytes: UInt64 = 0
+    @Published private(set) var sessionUploadedBytes: UInt64 = 0
+    @Published private(set) var lifetimeDownloadedBytes: UInt64 = 0
+    @Published private(set) var lifetimeUploadedBytes: UInt64 = 0
 
     private var audioPlayer: AVAudioPlayer?
     private var hasStartedProxy = false
     private var connectionsByID: [Int64: TrackedConnection] = [:]
     private var connectionOrder: [Int64] = []
+    private var transferTimer: Timer?
+    private var lastNativeDownloadedBytes: UInt64 = 0
+    private var lastNativeUploadedBytes: UInt64 = 0
 
     init() {
+        loadLifetimeTransferTotals()
         ConnectionEventBridge.receiver = self
         twosocks_set_connection_event_handler(twosocks_connection_event_bridge)
         setupBackgroundAudio()
+        startTransferPolling()
     }
 
     deinit {
+        transferTimer?.invalidate()
+
         if ConnectionEventBridge.receiver === self {
             ConnectionEventBridge.receiver = nil
         }
+    }
+
+    var downloadedDisplay: String {
+        Self.byteCountString(sessionDownloadedBytes)
+    }
+
+    var uploadedDisplay: String {
+        Self.byteCountString(sessionUploadedBytes)
+    }
+
+    var lifetimeDownloadedDisplay: String {
+        Self.byteCountString(lifetimeDownloadedBytes)
+    }
+
+    var lifetimeUploadedDisplay: String {
+        Self.byteCountString(lifetimeUploadedBytes)
     }
 
     func setInterfaceUnavailable() {
@@ -310,6 +340,54 @@ final class ContentViewVM: ObservableObject {
         activeConnectionCount = connections.lazy.filter { $0.state == .open }.count
     }
 
+    private func startTransferPolling() {
+        refreshTransferTotals()
+        transferTimer = Timer.scheduledTimer(withTimeInterval: transferPollInterval, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.refreshTransferTotals()
+            }
+        }
+    }
+
+    private func refreshTransferTotals() {
+        applyTransferTotals(
+            downloaded: twosocks_total_downloaded_bytes(),
+            uploaded: twosocks_total_uploaded_bytes()
+        )
+    }
+
+    private func applyTransferTotals(downloaded: UInt64, uploaded: UInt64) {
+        let downloadedDelta = downloaded >= lastNativeDownloadedBytes
+            ? downloaded - lastNativeDownloadedBytes
+            : downloaded
+        let uploadedDelta = uploaded >= lastNativeUploadedBytes
+            ? uploaded - lastNativeUploadedBytes
+            : uploaded
+
+        lastNativeDownloadedBytes = downloaded
+        lastNativeUploadedBytes = uploaded
+
+        guard downloadedDelta > 0 || uploadedDelta > 0 else { return }
+
+        sessionDownloadedBytes += downloadedDelta
+        sessionUploadedBytes += uploadedDelta
+        lifetimeDownloadedBytes += downloadedDelta
+        lifetimeUploadedBytes += uploadedDelta
+        persistLifetimeTransferTotals()
+    }
+
+    private func loadLifetimeTransferTotals() {
+        let defaults = UserDefaults.standard
+        lifetimeDownloadedBytes = Self.persistedByteCount(forKey: lifetimeDownloadedBytesKey, defaults: defaults)
+        lifetimeUploadedBytes = Self.persistedByteCount(forKey: lifetimeUploadedBytesKey, defaults: defaults)
+    }
+
+    private func persistLifetimeTransferTotals() {
+        let defaults = UserDefaults.standard
+        defaults.set(lifetimeDownloadedBytes, forKey: lifetimeDownloadedBytesKey)
+        defaults.set(lifetimeUploadedBytes, forKey: lifetimeUploadedBytesKey)
+    }
+
     private static func connectionTitle(host: String, port: UInt16) -> String {
         let normalizedHost = normalizedHostDisplay(host)
         return "\(normalizedHost):\(port)"
@@ -320,6 +398,15 @@ final class ContentViewVM: ObservableObject {
         guard host.contains(":") else { return host }
         guard !host.hasPrefix("[") && !host.hasSuffix("]") else { return host }
         return "[\(host)]"
+    }
+
+    private static func persistedByteCount(forKey key: String, defaults: UserDefaults) -> UInt64 {
+        (defaults.object(forKey: key) as? NSNumber)?.uint64Value ?? 0
+    }
+
+    private static func byteCountString(_ value: UInt64) -> String {
+        guard value > 0 else { return "0 B" }
+        return byteCountFormatter.string(fromByteCount: Int64(clamping: value))
     }
 
     private func errorDescription(for errorCode: Int32?) -> String {
@@ -372,6 +459,17 @@ final class ContentViewVM: ObservableObject {
             print("Failed to setup background audio:", error.localizedDescription)
         }
     }
+}
+
+private extension ContentViewVM {
+    static let byteCountFormatter: ByteCountFormatter = {
+        let formatter = ByteCountFormatter()
+        formatter.allowedUnits = [.useBytes, .useKB, .useMB, .useGB, .useTB]
+        formatter.countStyle = .file
+        formatter.includesActualByteCount = false
+        formatter.isAdaptive = true
+        return formatter
+    }()
 }
 
 private extension AVAudioPlayer {
