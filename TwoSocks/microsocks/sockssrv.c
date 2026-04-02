@@ -367,6 +367,42 @@ static ssize_t send_response(int fd, enum errorcode ec, union sockaddr_union* ad
     return write(fd, buf, len);
 }
 
+static int sockaddr_is_unspecified(const union sockaddr_union* addr) {
+    if(SOCKADDR_UNION_AF(addr) == AF_INET) {
+        return addr->v4.sin_addr.s_addr == htonl(INADDR_ANY);
+    } else if(SOCKADDR_UNION_AF(addr) == AF_INET6) {
+        return IN6_IS_ADDR_UNSPECIFIED(&addr->v6.sin6_addr);
+    }
+    return 1;
+}
+
+static int populate_udp_response_addr(int udp_fd, int tcp_fd, union sockaddr_union* response_addr) {
+    socklen_t udp_len = sizeof(*response_addr);
+    if(getsockname(udp_fd, (struct sockaddr*)response_addr, &udp_len)) {
+        return -1;
+    }
+    if(!sockaddr_is_unspecified(response_addr)) {
+        return 0;
+    }
+
+    union sockaddr_union tcp_local_addr;
+    socklen_t tcp_len = sizeof(tcp_local_addr);
+    if(getsockname(tcp_fd, (struct sockaddr*)&tcp_local_addr, &tcp_len)) {
+        return -1;
+    }
+    if(SOCKADDR_UNION_AF(&tcp_local_addr) != SOCKADDR_UNION_AF(response_addr)) {
+        return 0;
+    }
+
+    if(SOCKADDR_UNION_AF(response_addr) == AF_INET) {
+        response_addr->v4.sin_addr = tcp_local_addr.v4.sin_addr;
+    } else if(SOCKADDR_UNION_AF(response_addr) == AF_INET6) {
+        response_addr->v6.sin6_addr = tcp_local_addr.v6.sin6_addr;
+        response_addr->v6.sin6_scope_id = tcp_local_addr.v6.sin6_scope_id;
+    }
+    return 0;
+}
+
 static void send_error(int fd, enum errorcode ec) {
     /* position 4 contains ATYP, the address type, which is the same as used in the connect
        request. we're lazy and return always IPV4 address type in errors. */
@@ -913,8 +949,10 @@ static void* clientthread(void *data) {
                         goto breakloop;
                     }
 
-                    socklen_t len = sizeof(union sockaddr_union);
-                    if (getsockname(fd, (struct sockaddr*)&local_addr, &len)) goto breakloop;
+                    if(populate_udp_response_addr(fd, t->client.fd, &local_addr)) {
+                        close(fd);
+                        goto breakloop;
+                    }
                     if (-1 == send_response(t->client.fd, EC_SUCCESS, &local_addr)) {
                         close(fd);
                         goto breakloop;
