@@ -89,28 +89,28 @@ struct ContentView: View {
         LazyVGrid(columns: metricColumns, spacing: 10) {
             MetricCard(
                 title: "Downloaded",
-                value: formattedMegabytes(viewModel.runtimeStats.downloadBytes),
+                value: "--",
                 symbol: "arrow.down.circle.fill",
                 tint: .blue
             )
 
             MetricCard(
                 title: "Uploaded",
-                value: formattedMegabytes(viewModel.runtimeStats.uploadBytes),
+                value: "--",
                 symbol: "arrow.up.circle.fill",
                 tint: .orange
             )
 
             MetricCard(
                 title: "Active Clients",
-                value: "\(viewModel.runtimeStats.activeClients)",
+                value: "--",
                 symbol: "person.2.fill",
                 tint: .indigo
             )
 
             MetricCard(
                 title: "Attempts",
-                value: "\(viewModel.runtimeStats.totalConnectionAttempts)",
+                value: "--",
                 symbol: "bolt.horizontal.circle.fill",
                 tint: .green
             )
@@ -121,41 +121,15 @@ struct ContentView: View {
         DashboardPanel(
             title: "Connections"
         ) {
-            if viewModel.connectionAttemptLogs.isEmpty {
-                ContentUnavailableView {
-                    Label("No connections yet", systemImage: "network")
-                } description: {
-                    Text("New SOCKS connection attempts will appear here in real time.")
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .padding(.horizontal, 12)
-            } else {
-                ScrollView {
-                    LazyVStack(spacing: 0) {
-                        ForEach(Array(viewModel.connectionAttemptLogs.enumerated()), id: \.element.id) { index, logEntry in
-                            ConnectionAttemptLogRow(logEntry: logEntry)
-
-                            if index < viewModel.connectionAttemptLogs.count - 1 {
-                                Divider()
-                                    .padding(.leading, 36)
-                            }
-                        }
-                    }
-                }
-                .scrollIndicators(.visible)
+            ContentUnavailableView {
+                Label("Monitoring removed", systemImage: "network")
+            } description: {
+                Text("Live connection monitoring is disabled.")
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .padding(.horizontal, 12)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-
-    private func formattedMegabytes(_ bytes: UInt64) -> String {
-        let value = Double(bytes) / 1_000_000
-
-        if value < 10 {
-            return value.formatted(.number.precision(.fractionLength(2))) + " MByte"
-        }
-
-        return value.formatted(.number.precision(.fractionLength(1))) + " MByte"
     }
 
     private func startProxyIfPossible() {
@@ -270,49 +244,5 @@ private struct CardSurface<Content: View>: View {
                     .stroke(Color(uiColor: .separator).opacity(0.18), lineWidth: 0.5)
             )
             .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-    }
-}
-
-private struct ConnectionAttemptLogRow: View {
-    let logEntry: ConnectionAttemptLogEntry
-
-    var body: some View {
-        HStack(alignment: .top, spacing: 10) {
-            Circle()
-                .fill(logEntry.category.tint)
-                .frame(width: 10, height: 10)
-                .padding(.top, 5)
-
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Text(logEntry.endpoint)
-                        .font(.body.monospaced())
-                        .frame(maxWidth: .infinity, alignment: .leading)
-
-                    Text(logEntry.timestamp.formatted(date: .omitted, time: .shortened))
-                        .font(.caption2.monospaced())
-                        .foregroundStyle(.secondary)
-                }
-
-                HStack(spacing: 8) {
-                    if logEntry.detail != logEntry.endpoint {
-                        Text(logEntry.detail)
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    } else {
-                        Spacer(minLength: 0)
-                    }
-
-                    Text(logEntry.category.title)
-                        .font(.caption2.weight(.medium))
-                        .foregroundStyle(logEntry.category.tint)
-                }
-            }
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .textSelection(.enabled)
     }
 }
