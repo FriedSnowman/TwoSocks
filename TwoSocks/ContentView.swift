@@ -41,121 +41,146 @@ class AppDelegate: NSObject, UIApplicationDelegate {
 }
 
 struct ContentView: View {
-    @StateObject private var viewModel = ContentViewVM()
+    @StateObject private var viewModel: ContentViewVM
+    private let startsProxyOnAppear: Bool
 
     private let metricColumns = [
         GridItem(.flexible(), spacing: 10),
         GridItem(.flexible(), spacing: 10)
     ]
 
+    @MainActor
+    init() {
+        _viewModel = StateObject(wrappedValue: ContentViewVM())
+        startsProxyOnAppear = true
+    }
+
+    @MainActor
+    init(viewModel: ContentViewVM, startsProxyOnAppear: Bool = true) {
+        _viewModel = StateObject(wrappedValue: viewModel)
+        self.startsProxyOnAppear = startsProxyOnAppear
+    }
+
     var body: some View {
-        VStack(spacing: 10) {
-            headerRow
+        VStack(spacing: 16) {
             metricsRow
             connectionsPanel
         }
         .padding(.horizontal, 16)
-        .padding(.top, 8)
-        .padding(.bottom, 6)
+        .padding(.vertical, 16)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .background(Color(uiColor: .systemGroupedBackground).ignoresSafeArea())
-        .onAppear(perform: startProxyIfPossible)
+        .safeAreaInset(edge: .top, spacing: 0) {
+            headerRow
+        }
+        .onAppear {
+            guard startsProxyOnAppear else { return }
+            startProxyIfPossible()
+        }
     }
 
     private var headerRow: some View {
-        SummaryCard {
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 8) {
-                    Circle()
-                        .fill(viewModel.serverState.tint)
-                        .frame(width: 8, height: 8)
+        VStack(spacing: 0) {
+            HStack(alignment: .center, spacing: 12) {
+                Label {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Server \(viewModel.serverState.title)")
+                            .font(.subheadline.weight(.semibold))
 
-                    Text("Server \(viewModel.serverState.title)")
-                        .font(.headline)
+                        if viewModel.serverState != .running {
+                            Text(viewModel.serverState.detail)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(2)
+                        }
+                    }
+                } icon: {
+                    Image(systemName: viewModel.serverState.systemImage)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(viewModel.serverState.tint)
                 }
 
-                Text(viewModel.endpointDisplay)
-                    .font(.subheadline.monospaced())
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.8)
-                    .textSelection(.enabled)
+                if viewModel.serverState == .running {
+                    Spacer(minLength: 12)
+
+                    Text(viewModel.endpointDisplay)
+                        .font(.footnote.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                        .textSelection(.enabled)
+                }
             }
+            .padding(.horizontal, 16)
+            .padding(.top, 10)
+            .padding(.bottom, 12)
+
+            Divider()
         }
-        .fixedSize(horizontal: false, vertical: true)
+        .background(.bar)
     }
 
     private var metricsRow: some View {
         LazyVGrid(columns: metricColumns, spacing: 10) {
             MetricCard(
                 title: "Downloaded",
-                value: formattedMegabytes(viewModel.runtimeStats.downloadBytes),
+                value: viewModel.downloadedDisplay,
                 symbol: "arrow.down.circle.fill",
-                tint: .blue
+                tint: .blue,
+                secondaryTitle: "Total",
+                secondaryValue: viewModel.lifetimeDownloadedDisplay
             )
 
             MetricCard(
                 title: "Uploaded",
-                value: formattedMegabytes(viewModel.runtimeStats.uploadBytes),
+                value: viewModel.uploadedDisplay,
                 symbol: "arrow.up.circle.fill",
-                tint: .orange
-            )
-
-            MetricCard(
-                title: "Active Clients",
-                value: "\(viewModel.runtimeStats.activeClients)",
-                symbol: "person.2.fill",
-                tint: .indigo
-            )
-
-            MetricCard(
-                title: "Attempts",
-                value: "\(viewModel.runtimeStats.totalConnectionAttempts)",
-                symbol: "bolt.horizontal.circle.fill",
-                tint: .green
+                tint: .orange,
+                secondaryTitle: "Total",
+                secondaryValue: viewModel.lifetimeUploadedDisplay
             )
         }
     }
 
     private var connectionsPanel: some View {
         DashboardPanel(
-            title: "Connections"
+            title: viewModel.connectionsPanelTitle
         ) {
-            if viewModel.connectionAttemptLogs.isEmpty {
+            if viewModel.connections.isEmpty {
                 ContentUnavailableView {
                     Label("No connections yet", systemImage: "network")
                 } description: {
-                    Text("New SOCKS connection attempts will appear here in real time.")
+                    Text("Open traffic through the proxy to see status here.")
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .frame(maxWidth: .infinity)
                 .padding(.horizontal, 12)
+                .padding(.vertical, 28)
             } else {
                 ScrollView {
-                    LazyVStack(spacing: 0) {
-                        ForEach(Array(viewModel.connectionAttemptLogs.enumerated()), id: \.element.id) { index, logEntry in
-                            ConnectionAttemptLogRow(logEntry: logEntry)
+                    LazyVStack(alignment: .leading, spacing: 12) {
+                        if !viewModel.liveConnections.isEmpty {
+                            ConnectionsSectionView(
+                                title: "Open",
+                                connections: viewModel.liveConnections,
+                                detailProvider: viewModel.statusDetail(for:)
+                            )
+                        }
 
-                            if index < viewModel.connectionAttemptLogs.count - 1 {
-                                Divider()
-                                    .padding(.leading, 36)
-                            }
+                        if !viewModel.recentConnections.isEmpty {
+                            ConnectionsSectionView(
+                                title: viewModel.liveConnections.isEmpty ? "Recent" : "Recent Activity",
+                                connections: viewModel.recentConnections,
+                                detailProvider: viewModel.statusDetail(for:)
+                            )
                         }
                     }
+                    .padding(12)
+                    .frame(maxWidth: .infinity, alignment: .top)
                 }
-                .scrollIndicators(.visible)
+                .scrollBounceBehavior(.basedOnSize)
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-
-    private func formattedMegabytes(_ bytes: UInt64) -> String {
-        let value = Double(bytes) / 1_000_000
-
-        if value < 10 {
-            return value.formatted(.number.precision(.fractionLength(2))) + " MByte"
-        }
-
-        return value.formatted(.number.precision(.fractionLength(1))) + " MByte"
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }
 
     private func startProxyIfPossible() {
@@ -196,6 +221,8 @@ private struct MetricCard: View {
     let value: String
     let symbol: String
     let tint: Color
+    var secondaryTitle: String?
+    var secondaryValue: String?
 
     var body: some View {
         CardSurface {
@@ -211,15 +238,122 @@ private struct MetricCard: View {
                         .foregroundStyle(.secondary)
                 }
 
-                Text(value)
-                    .font(.title3.weight(.semibold))
-                    .monospacedDigit()
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.8)
+                if let secondaryTitle, let secondaryValue {
+                    HStack(alignment: .center, spacing: 10) {
+                        Text(value)
+                            .font(.title3.weight(.semibold))
+                            .foregroundStyle(.primary)
+                            .monospacedDigit()
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.7)
+
+                        Spacer(minLength: 8)
+
+                        VStack(alignment: .trailing, spacing: 2) {
+                            Text(secondaryTitle)
+                                .font(.caption2.weight(.medium))
+                                .foregroundStyle(.secondary)
+
+                            Text(secondaryValue)
+                                .font(.footnote.weight(.semibold))
+                                .foregroundStyle(.primary)
+                                .monospacedDigit()
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.7)
+                        }
+                    }
+                } else {
+                    Text(value)
+                        .font(.title3.weight(.semibold))
+                        .monospacedDigit()
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
+        }
+    }
+}
+
+private struct ConnectionRowView: View {
+    let connection: TrackedConnection
+    let detail: String
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: connection.protocolType.systemImage)
+                .font(.headline)
+                .foregroundStyle(connection.state.tint)
+                .frame(width: 24, height: 24)
+                .padding(.top, 2)
+
+            VStack(alignment: .leading, spacing: 1) {
+                Text(connection.title)
+                    .font(.subheadline.monospaced())
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+                    .textSelection(.enabled)
+
+                Text(detail)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+
+            Spacer(minLength: 12)
+
+            ConnectionStateBadge(state: connection.state)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 5)
+        .padding(.vertical, 5)
+    }
+}
+
+private struct ConnectionStateBadge: View {
+    let state: ProxyConnectionState
+
+    var body: some View {
+        Text(state.title)
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(state.tint)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(state.tint.opacity(0.14), in: Capsule())
+    }
+}
+
+private struct ConnectionsSectionView: View {
+    let title: String
+    let connections: [TrackedConnection]
+    let detailProvider: (TrackedConnection) -> String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .textCase(.uppercase)
+                .padding(.horizontal, 2)
+
+            CardSurface {
+                VStack(spacing: 4) {
+                    ForEach(connections) { connection in
+                        ConnectionRowView(
+                            connection: connection,
+                            detail: detailProvider(connection)
+                        )
+
+                        if connection.id != connections.last?.id {
+                            Divider()
+                                .padding(.leading, 52)
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -273,46 +407,11 @@ private struct CardSurface<Content: View>: View {
     }
 }
 
-private struct ConnectionAttemptLogRow: View {
-    let logEntry: ConnectionAttemptLogEntry
-
-    var body: some View {
-        HStack(alignment: .top, spacing: 10) {
-            Circle()
-                .fill(logEntry.category.tint)
-                .frame(width: 10, height: 10)
-                .padding(.top, 5)
-
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Text(logEntry.endpoint)
-                        .font(.body.monospaced())
-                        .frame(maxWidth: .infinity, alignment: .leading)
-
-                    Text(logEntry.timestamp.formatted(date: .omitted, time: .shortened))
-                        .font(.caption2.monospaced())
-                        .foregroundStyle(.secondary)
-                }
-
-                HStack(spacing: 8) {
-                    if logEntry.detail != logEntry.endpoint {
-                        Text(logEntry.detail)
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    } else {
-                        Spacer(minLength: 0)
-                    }
-
-                    Text(logEntry.category.title)
-                        .font(.caption2.weight(.medium))
-                        .foregroundStyle(logEntry.category.tint)
-                }
-            }
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .textSelection(.enabled)
-    }
+#if DEBUG
+#Preview("Dashboard") {
+    ContentView(
+        viewModel: ContentViewVM.previewDashboard(),
+        startsProxyOnAppear: false
+    )
 }
+#endif

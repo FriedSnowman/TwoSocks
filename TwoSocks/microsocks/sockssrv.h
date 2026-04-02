@@ -52,23 +52,32 @@ enum socks5_socket_type {
     UDP_SOCKET =2,
 };
 
+enum twosocks_connection_state {
+    TWOSOCKS_CONNECTION_OPEN = 0,
+    TWOSOCKS_CONNECTION_CLOSED = 1,
+    TWOSOCKS_CONNECTION_ERROR = 2,
+};
+
+enum twosocks_connection_protocol {
+    TWOSOCKS_CONNECTION_PROTOCOL_TCP = 0,
+    TWOSOCKS_CONNECTION_PROTOCOL_UDP = 1,
+};
+
+typedef void (*twosocks_connection_event_handler)(
+    int64_t identifier,
+    int32_t protocol,
+    int32_t state,
+    const char* host,
+    uint16_t port,
+    int32_t error_code
+);
+
 #define MAX_DNS_LEN    ((2 << 8) - 1)
 #define MAX_SOCKS5_HEADER_LEN (2 + 1 + 1 + 1 + MAX_DNS_LEN + 2)
 
-typedef struct TwoSocksStatsSnapshot {
-    uint64_t uploadBytes;
-    uint64_t downloadBytes;
-    uint32_t activeClients;
-    uint32_t successfulConnections;
-    uint32_t failedConnections;
-    uint32_t totalClientSessions;
-    uint32_t serverIsRunning;
-    int32_t lastServerErrorCode;
-} TwoSocksStatsSnapshot;
-
 int socks_main(int argc, char** argv);
-int twosocks_dequeue_connection_log(char *buffer, int bufferLength);
-void twosocks_get_stats_snapshot(TwoSocksStatsSnapshot *snapshot);
-void twosocks_reset_runtime_state(void);
+void twosocks_set_connection_event_handler(twosocks_connection_event_handler handler);
+uint64_t twosocks_total_downloaded_bytes(void);
+uint64_t twosocks_total_uploaded_bytes(void);
 
 #endif

@@ -2,34 +2,11 @@ import AVFoundation
 import Foundation
 import SwiftUI
 
-private let maxConnectionAttemptLogEntries = 150
-private let connectionLogMessageBufferSize = 512
 private let proxyPort = 4884
-private let activeRuntimePollingInterval = Duration.milliseconds(250)
-private let idleRuntimePollingInterval = Duration.seconds(1)
-
-private func drainNativeConnectionLogs() -> [String] {
-    var messages: [String] = []
-    var buffer = [CChar](repeating: 0, count: connectionLogMessageBufferSize)
-
-    while true {
-        let didRead = buffer.withUnsafeMutableBufferPointer { pointer in
-            guard let baseAddress = pointer.baseAddress else { return false }
-            return twosocks_dequeue_connection_log(baseAddress, Int32(pointer.count)) != 0
-        }
-
-        guard didRead else { break }
-        messages.append(String(cString: buffer))
-    }
-
-    return messages
-}
-
-private func readNativeRuntimeStats() -> ProxyRuntimeStats {
-    var snapshot = TwoSocksStatsSnapshot()
-    twosocks_get_stats_snapshot(&snapshot)
-    return ProxyRuntimeStats(snapshot: snapshot)
-}
+private let maxRetainedEndedConnections = 100
+private let transferPollInterval: TimeInterval = 0.5
+private let lifetimeDownloadedBytesKey = "lifetimeDownloadedBytes"
+private let lifetimeUploadedBytesKey = "lifetimeUploadedBytes"
 
 enum ProxyServerState: Equatable {
     case waitingForNetwork
@@ -90,123 +67,195 @@ enum ProxyServerState: Equatable {
     }
 }
 
-enum ConnectionLogCategory {
-    case success
-    case failure
-    case info
+enum ProxyConnectionProtocol: Int32 {
+    case tcp = 0
+    case udp = 1
 
     var title: String {
         switch self {
-        case .success:
-            return "Connected"
-        case .failure:
-            return "Failed"
-        case .info:
-            return "Info"
+        case .tcp:
+            return "TCP"
+        case .udp:
+            return "UDP"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .tcp:
+            return "arrow.left.arrow.right.circle.fill"
+        case .udp:
+            return "dot.radiowaves.left.and.right"
+        }
+    }
+}
+
+enum ProxyConnectionState: Int32 {
+    case open = 0
+    case closed = 1
+    case error = 2
+
+    var title: String {
+        switch self {
+        case .open:
+            return "Open"
+        case .closed:
+            return "Closed"
+        case .error:
+            return "Error"
         }
     }
 
     var tint: Color {
         switch self {
-        case .success:
+        case .open:
             return .green
-        case .failure:
+        case .closed:
+            return .secondary
+        case .error:
             return .red
-        case .info:
-            return .blue
         }
     }
 }
 
-struct ProxyRuntimeStats: Equatable {
-    var uploadBytes: UInt64 = 0
-    var downloadBytes: UInt64 = 0
-    var activeClients: Int = 0
-    var successfulConnections: Int = 0
-    var failedConnections: Int = 0
-    var totalClientSessions: Int = 0
-    var serverIsRunning = false
-    var lastServerErrorCode: Int32 = 0
-
-    init() {}
-
-    init(snapshot: TwoSocksStatsSnapshot) {
-        uploadBytes = snapshot.uploadBytes
-        downloadBytes = snapshot.downloadBytes
-        activeClients = Int(snapshot.activeClients)
-        successfulConnections = Int(snapshot.successfulConnections)
-        failedConnections = Int(snapshot.failedConnections)
-        totalClientSessions = Int(snapshot.totalClientSessions)
-        serverIsRunning = snapshot.serverIsRunning != 0
-        lastServerErrorCode = snapshot.lastServerErrorCode
-    }
-
-    var totalConnectionAttempts: Int {
-        successfulConnections + failedConnections
-    }
+struct TrackedConnection: Identifiable {
+    let id: Int64
+    var title: String
+    var protocolType: ProxyConnectionProtocol
+    var state: ProxyConnectionState
+    var updatedAt: Date
+    var errorCode: Int32?
 }
 
-struct ConnectionAttemptLogEntry: Identifiable {
-    let id = UUID()
-    let timestamp = Date()
-    let message: String
+private final class ConnectionEventBridge {
+    static weak var receiver: ContentViewVM?
+}
 
-    var category: ConnectionLogCategory {
-        if message.localizedCaseInsensitiveContains("failed") {
-            return .failure
-        }
-        if message.localizedCaseInsensitiveContains("connected") {
-            return .success
-        }
-        return .info
-    }
+@_cdecl("twosocks_connection_event_bridge")
+func twosocks_connection_event_bridge(
+    _ identifier: Int64,
+    _ protocolRaw: Int32,
+    _ stateRaw: Int32,
+    _ host: UnsafePointer<CChar>?,
+    _ port: UInt16,
+    _ errorCode: Int32
+) {
+    let endpointHost = host.map { String(cString: $0) } ?? ""
 
-    var endpoint: String {
-        if let boundary = message.range(of: " failed") {
-            return String(message[..<boundary.lowerBound])
-        }
-        if let boundary = message.range(of: " connected") {
-            return String(message[..<boundary.lowerBound])
-        }
-        return message
-    }
-
-    var detail: String {
-        if let boundary = message.range(of: " failed") {
-            let suffix = message[boundary.lowerBound...].trimmingCharacters(in: .whitespaces)
-            return suffix.isEmpty ? "Failed" : suffix.prefix(1).uppercased() + String(suffix.dropFirst())
-        }
-        if message.localizedCaseInsensitiveContains("connected") {
-            return "Connected"
-        }
-        return message
+    Task { @MainActor in
+        ConnectionEventBridge.receiver?.handleConnectionEvent(
+            id: identifier,
+            protocolRaw: protocolRaw,
+            stateRaw: stateRaw,
+            host: endpointHost,
+            port: port,
+            errorCode: errorCode
+        )
     }
 }
 
 @MainActor
-class ContentViewVM: ObservableObject {
+final class ContentViewVM: ObservableObject {
     @Published private(set) var serverState: ProxyServerState = .starting
     @Published private(set) var endpointDisplay = "Detecting local IP"
-    @Published private(set) var runtimeStats = ProxyRuntimeStats()
-    @Published private(set) var serverStartedAt: Date?
-    @Published private(set) var connectionAttemptLogs: [ConnectionAttemptLogEntry] = []
+    @Published private(set) var connections: [TrackedConnection] = []
+    @Published private(set) var sessionDownloadedBytes: UInt64 = 0
+    @Published private(set) var sessionUploadedBytes: UInt64 = 0
+    @Published private(set) var lifetimeDownloadedBytes: UInt64 = 0
+    @Published private(set) var lifetimeUploadedBytes: UInt64 = 0
 
     private var audioPlayer: AVAudioPlayer?
-    private var runtimePollingTask: Task<Void, Never>?
     private var hasStartedProxy = false
+    private var connectionsByID: [Int64: TrackedConnection] = [:]
+    private var connectionOrder: [Int64] = []
+    private var transferTimer: Timer?
+    private var lastNativeDownloadedBytes: UInt64 = 0
+    private var lastNativeUploadedBytes: UInt64 = 0
+
+    #if DEBUG
+    struct PreviewState {
+        let serverState: ProxyServerState
+        let endpointDisplay: String
+        let connections: [TrackedConnection]
+        let sessionDownloadedBytes: UInt64
+        let sessionUploadedBytes: UInt64
+        let lifetimeDownloadedBytes: UInt64
+        let lifetimeUploadedBytes: UInt64
+    }
+    #endif
 
     init() {
+        loadLifetimeTransferTotals()
+        ConnectionEventBridge.receiver = self
+        twosocks_set_connection_event_handler(twosocks_connection_event_bridge)
         setupBackgroundAudio()
+        startTransferPolling()
     }
 
+    #if DEBUG
+    init(previewState: PreviewState) {
+        serverState = previewState.serverState
+        endpointDisplay = previewState.endpointDisplay
+        connections = previewState.connections
+        sessionDownloadedBytes = previewState.sessionDownloadedBytes
+        sessionUploadedBytes = previewState.sessionUploadedBytes
+        lifetimeDownloadedBytes = previewState.lifetimeDownloadedBytes
+        lifetimeUploadedBytes = previewState.lifetimeUploadedBytes
+        connectionsByID = Dictionary(uniqueKeysWithValues: previewState.connections.map { ($0.id, $0) })
+        connectionOrder = previewState.connections.map(\.id)
+    }
+    #endif
+
     deinit {
-        runtimePollingTask?.cancel()
+        transferTimer?.invalidate()
+
+        if ConnectionEventBridge.receiver === self {
+            ConnectionEventBridge.receiver = nil
+        }
+    }
+
+    var downloadedDisplay: String {
+        Self.byteCountString(sessionDownloadedBytes)
+    }
+
+    var uploadedDisplay: String {
+        Self.byteCountString(sessionUploadedBytes)
+    }
+
+    var lifetimeDownloadedDisplay: String {
+        Self.byteCountString(lifetimeDownloadedBytes)
+    }
+
+    var lifetimeUploadedDisplay: String {
+        Self.byteCountString(lifetimeUploadedBytes)
+    }
+
+    var openConnectionCount: Int {
+        connections.lazy.filter { $0.state == .open }.count
+    }
+
+    var liveConnections: [TrackedConnection] {
+        connections.filter { $0.state == .open }
+    }
+
+    var recentConnections: [TrackedConnection] {
+        connections.filter { $0.state != .open }
+    }
+
+    var connectionsPanelTitle: String {
+        switch openConnectionCount {
+        case 0:
+            return "Connections"
+        case 1:
+            return "1 Connection"
+        default:
+            return "\(openConnectionCount) Connections"
+        }
     }
 
     func setInterfaceUnavailable() {
         serverState = .waitingForNetwork
         endpointDisplay = "bridge100/en0 not available"
-        runtimeStats = ProxyRuntimeStats()
     }
 
     func startProxy(ipAddress: String) {
@@ -215,11 +264,6 @@ class ContentViewVM: ObservableObject {
         hasStartedProxy = true
         serverState = .starting
         endpointDisplay = "\(ipAddress):\(proxyPort)"
-        runtimeStats = ProxyRuntimeStats()
-        connectionAttemptLogs = []
-        serverStartedAt = nil
-        twosocks_reset_runtime_state()
-        startRuntimePolling()
 
         Task.detached(priority: .userInitiated) { [weak self] in
             let arguments = ["microsocks", "-p", String(proxyPort)]
@@ -235,56 +279,71 @@ class ContentViewVM: ObservableObject {
             }
             argv[arguments.count] = nil
 
+            await self?.markServerRunning()
             let status = socks_main(argc, argv)
             guard status != 0 else { return }
             await self?.markServerFailed(code: Int32(status))
         }
     }
 
-    private func startRuntimePolling() {
-        guard runtimePollingTask == nil else { return }
+    fileprivate func handleConnectionEvent(
+        id: Int64,
+        protocolRaw: Int32,
+        stateRaw: Int32,
+        host: String,
+        port: UInt16,
+        errorCode: Int32
+    ) {
+        guard
+            let protocolType = ProxyConnectionProtocol(rawValue: protocolRaw),
+            let state = ProxyConnectionState(rawValue: stateRaw)
+        else {
+            return
+        }
 
-        runtimePollingTask = Task.detached(priority: .utility) { [weak self] in
-            var lastObservedStats: ProxyRuntimeStats?
+        let title = Self.connectionTitle(host: host, port: port)
+        let now = Date()
 
-            while !Task.isCancelled {
-                let messages = drainNativeConnectionLogs()
-                let stats = readNativeRuntimeStats()
-                let didStatsChange = lastObservedStats != stats
-                let didObserveActivity = didStatsChange || !messages.isEmpty
+        if var existing = connectionsByID[id] {
+            existing.title = title
+            existing.protocolType = protocolType
+            existing.state = state
+            existing.updatedAt = now
+            existing.errorCode = state == .error ? errorCode : nil
+            connectionsByID[id] = existing
+            moveConnectionToFront(id)
+        } else {
+            let connection = TrackedConnection(
+                id: id,
+                title: title,
+                protocolType: protocolType,
+                state: state,
+                updatedAt: now,
+                errorCode: state == .error ? errorCode : nil
+            )
+            connectionsByID[id] = connection
+            connectionOrder.insert(id, at: 0)
+        }
 
-                guard let self else { break }
-                if didObserveActivity {
-                    await self.refreshRuntimeState(stats: stats, newMessages: messages)
-                }
+        trimEndedConnections()
+        publishConnections()
+    }
 
-                lastObservedStats = stats
-
-                try? await Task.sleep(for: Self.runtimePollingInterval(for: stats, observedActivity: didObserveActivity))
-            }
+    func statusDetail(for connection: TrackedConnection) -> String {
+        let timestamp = connection.updatedAt.formatted(date: .omitted, time: .standard)
+        switch connection.state {
+        case .open:
+            return "\(connection.protocolType.title) • Open as of \(timestamp)"
+        case .closed:
+            return "\(connection.protocolType.title) • Closed at \(timestamp)"
+        case .error:
+            return "\(connection.protocolType.title) • \(errorDescription(for: connection.errorCode))"
         }
     }
 
-    private func refreshRuntimeState(stats: ProxyRuntimeStats, newMessages: [String]) {
-        if runtimeStats != stats {
-            runtimeStats = stats
-        }
-
-        if !newMessages.isEmpty {
-            appendConnectionLogs(newMessages)
-        }
-
-        let nextServerState = derivedServerState(from: stats)
-        if serverState != nextServerState {
-            serverState = nextServerState
-        }
-
-        if nextServerState == .running {
-            if serverStartedAt == nil {
-                serverStartedAt = Date()
-            }
-        } else if serverStartedAt != nil {
-            serverStartedAt = nil
+    private func markServerRunning() {
+        if serverState != .running {
+            serverState = .running
         }
     }
 
@@ -293,18 +352,133 @@ class ContentViewVM: ObservableObject {
         if serverState != failedState {
             serverState = failedState
         }
-        if serverStartedAt != nil {
-            serverStartedAt = nil
+    }
+
+    private func moveConnectionToFront(_ id: Int64) {
+        connectionOrder.removeAll(where: { $0 == id })
+        connectionOrder.insert(id, at: 0)
+    }
+
+    private func trimEndedConnections() {
+        var endedCount = 0
+        var idsToRemove = Set<Int64>()
+
+        for id in connectionOrder.reversed() {
+            guard let connection = connectionsByID[id] else { continue }
+            guard connection.state != .open else { continue }
+
+            endedCount += 1
+            if endedCount > maxRetainedEndedConnections {
+                idsToRemove.insert(id)
+            }
+        }
+
+        guard !idsToRemove.isEmpty else { return }
+
+        for id in idsToRemove {
+            connectionsByID.removeValue(forKey: id)
+        }
+        connectionOrder.removeAll(where: idsToRemove.contains)
+    }
+
+    private func publishConnections() {
+        let orderedConnections = connectionOrder.compactMap { connectionsByID[$0] }
+        let liveConnections = orderedConnections.filter { $0.state == .open }
+        let endedConnections = orderedConnections.filter { $0.state != .open }
+        connections = liveConnections + endedConnections
+    }
+
+    private func startTransferPolling() {
+        refreshTransferTotals()
+        transferTimer = Timer.scheduledTimer(withTimeInterval: transferPollInterval, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.refreshTransferTotals()
+            }
         }
     }
 
-    private func appendConnectionLogs(_ messages: [String]) {
-        for message in messages {
-            connectionAttemptLogs.insert(ConnectionAttemptLogEntry(message: message), at: 0)
-        }
+    private func refreshTransferTotals() {
+        applyTransferTotals(
+            downloaded: twosocks_total_downloaded_bytes(),
+            uploaded: twosocks_total_uploaded_bytes()
+        )
+    }
 
-        if connectionAttemptLogs.count > maxConnectionAttemptLogEntries {
-            connectionAttemptLogs.removeLast(connectionAttemptLogs.count - maxConnectionAttemptLogEntries)
+    private func applyTransferTotals(downloaded: UInt64, uploaded: UInt64) {
+        let downloadedDelta = downloaded >= lastNativeDownloadedBytes
+            ? downloaded - lastNativeDownloadedBytes
+            : downloaded
+        let uploadedDelta = uploaded >= lastNativeUploadedBytes
+            ? uploaded - lastNativeUploadedBytes
+            : uploaded
+
+        lastNativeDownloadedBytes = downloaded
+        lastNativeUploadedBytes = uploaded
+
+        guard downloadedDelta > 0 || uploadedDelta > 0 else { return }
+
+        sessionDownloadedBytes += downloadedDelta
+        sessionUploadedBytes += uploadedDelta
+        lifetimeDownloadedBytes += downloadedDelta
+        lifetimeUploadedBytes += uploadedDelta
+        persistLifetimeTransferTotals()
+    }
+
+    private func loadLifetimeTransferTotals() {
+        let defaults = UserDefaults.standard
+        lifetimeDownloadedBytes = Self.persistedByteCount(forKey: lifetimeDownloadedBytesKey, defaults: defaults)
+        lifetimeUploadedBytes = Self.persistedByteCount(forKey: lifetimeUploadedBytesKey, defaults: defaults)
+    }
+
+    private func persistLifetimeTransferTotals() {
+        let defaults = UserDefaults.standard
+        defaults.set(lifetimeDownloadedBytes, forKey: lifetimeDownloadedBytesKey)
+        defaults.set(lifetimeUploadedBytes, forKey: lifetimeUploadedBytesKey)
+    }
+
+    private static func connectionTitle(host: String, port: UInt16) -> String {
+        let normalizedHost = normalizedHostDisplay(host)
+        return "\(normalizedHost):\(port)"
+    }
+
+    private static func normalizedHostDisplay(_ host: String) -> String {
+        guard !host.isEmpty else { return "unknown" }
+        guard host.contains(":") else { return host }
+        guard !host.hasPrefix("[") && !host.hasSuffix("]") else { return host }
+        return "[\(host)]"
+    }
+
+    private static func persistedByteCount(forKey key: String, defaults: UserDefaults) -> UInt64 {
+        (defaults.object(forKey: key) as? NSNumber)?.uint64Value ?? 0
+    }
+
+    private static func byteCountString(_ value: UInt64) -> String {
+        guard value > 0 else { return "0 B" }
+        return byteCountFormatter.string(fromByteCount: Int64(clamping: value))
+    }
+
+    private func errorDescription(for errorCode: Int32?) -> String {
+        switch errorCode {
+        case .some(3):
+            return "Network unreachable"
+        case .some(4):
+            return "Host unreachable"
+        case .some(5):
+            return "Connection refused"
+        case .some(6):
+            return "Connection timed out"
+        case .some(7):
+            return "Command not supported"
+        case .some(8):
+            return "Address type not supported"
+        case .some(9):
+            return "Bind address unavailable"
+        case .some(1):
+            return "General failure"
+        case .some(let code):
+            return "Error \(code)"
+        case .none:
+            return "General failure"
         }
     }
 
@@ -333,30 +507,87 @@ class ContentViewVM: ObservableObject {
             print("Failed to setup background audio:", error.localizedDescription)
         }
     }
+}
 
-    private func derivedServerState(from stats: ProxyRuntimeStats) -> ProxyServerState {
-        if stats.serverIsRunning {
-            return .running
-        }
-        if stats.lastServerErrorCode != 0 {
-            return .failed(stats.lastServerErrorCode)
-        }
-        if hasStartedProxy {
-            return .starting
-        }
-        return .waitingForNetwork
-    }
+private extension ContentViewVM {
+    static let byteCountFormatter: ByteCountFormatter = {
+        let formatter = ByteCountFormatter()
+        formatter.allowedUnits = [.useBytes, .useKB, .useMB, .useGB, .useTB]
+        formatter.countStyle = .file
+        formatter.includesActualByteCount = false
+        formatter.isAdaptive = true
+        return formatter
+    }()
+}
 
-    private static func runtimePollingInterval(for stats: ProxyRuntimeStats, observedActivity: Bool) -> Duration {
-        if stats.lastServerErrorCode != 0 {
-            return idleRuntimePollingInterval
-        }
-        if observedActivity || stats.activeClients > 0 || !stats.serverIsRunning {
-            return activeRuntimePollingInterval
-        }
-        return idleRuntimePollingInterval
+#if DEBUG
+extension ContentViewVM {
+    static func previewDashboard(now: Date = .now) -> ContentViewVM {
+        let connections = [
+            TrackedConnection(
+                id: 1,
+                title: "api.supreme-cat.biz:443",
+                protocolType: .tcp,
+                state: .open,
+                updatedAt: now,
+                errorCode: nil
+            ),
+            TrackedConnection(
+                id: 2,
+                title: "8.8.8.8:53",
+                protocolType: .udp,
+                state: .open,
+                updatedAt: now.addingTimeInterval(-8),
+                errorCode: nil
+            ),
+            TrackedConnection(
+                id: 3,
+                title: "cdn.mystery-meat.invalid:80",
+                protocolType: .tcp,
+                state: .closed,
+                updatedAt: now.addingTimeInterval(-42),
+                errorCode: nil
+            ),
+            TrackedConnection(
+                id: 4,
+                title: "239.255.255.250:1900",
+                protocolType: .udp,
+                state: .closed,
+                updatedAt: now.addingTimeInterval(-73),
+                errorCode: nil
+            ),
+            TrackedConnection(
+                id: 5,
+                title: "bank-of-lizards.example:22",
+                protocolType: .tcp,
+                state: .error,
+                updatedAt: now.addingTimeInterval(-96),
+                errorCode: 5
+            ),
+            TrackedConnection(
+                id: 6,
+                title: "[2606:4700:4700::1111]:53",
+                protocolType: .udp,
+                state: .error,
+                updatedAt: now.addingTimeInterval(-140),
+                errorCode: 3
+            )
+        ]
+
+        return ContentViewVM(
+            previewState: PreviewState(
+                serverState: .running,
+                endpointDisplay: "10.13.37.2:4884",
+                connections: connections,
+                sessionDownloadedBytes: 842_000_000,
+                sessionUploadedBytes: 131_000_000,
+                lifetimeDownloadedBytes: 12_400_000_000,
+                lifetimeUploadedBytes: 3_800_000_000
+            )
+        )
     }
 }
+#endif
 
 private extension AVAudioPlayer {
     func configure(_ configuration: (AVAudioPlayer) -> Void) {
