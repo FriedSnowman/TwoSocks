@@ -62,16 +62,17 @@ struct ContentView: View {
     }
 
     var body: some View {
-        VStack(spacing: 10) {
-            headerRow
+        VStack(spacing: 16) {
             metricsRow
             connectionsPanel
         }
         .padding(.horizontal, 16)
-        .padding(.top, 8)
-        .padding(.bottom, 6)
+        .padding(.vertical, 16)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .background(Color(uiColor: .systemGroupedBackground).ignoresSafeArea())
+        .safeAreaInset(edge: .top, spacing: 0) {
+            headerRow
+        }
         .onAppear {
             guard startsProxyOnAppear else { return }
             startProxyIfPossible()
@@ -79,33 +80,44 @@ struct ContentView: View {
     }
 
     private var headerRow: some View {
-        SummaryCard {
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 8) {
-                    Circle()
-                        .fill(viewModel.serverState.tint)
-                        .frame(width: 8, height: 8)
+        VStack(spacing: 0) {
+            HStack(alignment: .center, spacing: 12) {
+                Label {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Server \(viewModel.serverState.title)")
+                            .font(.subheadline.weight(.semibold))
 
-                    Text("Server \(viewModel.serverState.title)")
-                        .font(.headline)
+                        if viewModel.serverState != .running {
+                            Text(viewModel.serverState.detail)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(2)
+                        }
+                    }
+                } icon: {
+                    Image(systemName: viewModel.serverState.systemImage)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(viewModel.serverState.tint)
                 }
 
                 if viewModel.serverState == .running {
+                    Spacer(minLength: 12)
+
                     Text(viewModel.endpointDisplay)
-                        .font(.subheadline.monospaced())
+                        .font(.footnote.monospaced())
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .minimumScaleFactor(0.8)
                         .textSelection(.enabled)
-                } else {
-                    Text(viewModel.serverState.detail)
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
                 }
             }
+            .padding(.horizontal, 16)
+            .padding(.top, 10)
+            .padding(.bottom, 12)
+
+            Divider()
         }
-        .fixedSize(horizontal: false, vertical: true)
+        .background(.bar)
     }
 
     private var metricsRow: some View {
@@ -140,8 +152,9 @@ struct ContentView: View {
                 } description: {
                     Text("Open traffic through the proxy to see status here.")
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .frame(maxWidth: .infinity)
                 .padding(.horizontal, 12)
+                .padding(.vertical, 28)
             } else {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 12) {
@@ -162,11 +175,12 @@ struct ContentView: View {
                         }
                     }
                     .padding(12)
+                    .frame(maxWidth: .infinity, alignment: .top)
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                .scrollBounceBehavior(.basedOnSize)
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }
 
     private func startProxyIfPossible() {
@@ -275,7 +289,7 @@ private struct ConnectionRowView: View {
                 .frame(width: 24, height: 24)
                 .padding(.top, 2)
 
-            VStack(alignment: .leading, spacing: 6) {
+            VStack(alignment: .leading, spacing: 1) {
                 Text(connection.title)
                     .font(.subheadline.monospaced())
                     .foregroundStyle(.primary)
@@ -294,8 +308,8 @@ private struct ConnectionRowView: View {
             ConnectionStateBadge(state: connection.state)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, 14)
-        .padding(.vertical, 12)
+        .padding(.horizontal, 5)
+        .padding(.vertical, 5)
     }
 }
 
@@ -318,16 +332,15 @@ private struct ConnectionsSectionView: View {
     let detailProvider: (TrackedConnection) -> String
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
+        VStack(alignment: .leading, spacing: 4) {
             Text(title)
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.secondary)
                 .textCase(.uppercase)
                 .padding(.horizontal, 2)
-                .padding(.bottom, 6)
 
             CardSurface {
-                VStack(spacing: 0) {
+                VStack(spacing: 4) {
                     ForEach(connections) { connection in
                         ConnectionRowView(
                             connection: connection,
