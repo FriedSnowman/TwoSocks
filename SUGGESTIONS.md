@@ -10,7 +10,7 @@ I am also not recommending a deep rewrite to `Network.framework`, `kqueue`, or a
 2. [ ] Replace the global transfer-total mutexes with atomics or with coarser-grained flushing.
 `record_downloaded_bytes()` and `record_uploaded_bytes()` take a process-wide mutex for every chunk in both the TCP and UDP loops (`TwoSocks/microsocks/sockssrv.c:117-142`, `TwoSocks/microsocks/sockssrv.c:473-476`, `TwoSocks/microsocks/sockssrv.c:726`, `TwoSocks/microsocks/sockssrv.c:788`). That is fine at low traffic, but it becomes unnecessary hot-path contention once the proxy is moving real volume. This is a good place for `stdatomic` counters or for per-connection byte accumulation that flushes less often.
 
-3. [ ] Fix `copyloop()` so `poll()` hangups and errors cannot make it read from the wrong socket.
+3. [x] Fix `copyloop()` so `poll()` hangups and errors cannot make it read from the wrong socket.
 After `poll()`, the code only checks `POLLIN` and then picks `fd1` or `fd2` with a single ternary (`TwoSocks/microsocks/sockssrv.c:454-470`). If `poll()` wakes because one side has `POLLHUP` or `POLLERR` without `POLLIN`, this logic can choose the other socket and block on a fresh `read()` even though the event came from the first one. This is a correctness issue first, but it also creates avoidable stalls in the TCP hot path.
 
 4. [ ] Stop truncating UDP payloads at 1024 bytes.

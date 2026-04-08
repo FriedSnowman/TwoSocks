@@ -444,6 +444,54 @@ static void flush_pending_transfer_totals(size_t *downloaded_bytes, size_t *uplo
     }
 }
 
+static int poll_revents_have_error(short revents) {
+    return (revents & (POLLERR | POLLNVAL)) != 0;
+}
+
+static int poll_revents_have_hangup(short revents) {
+#ifdef POLLRDHUP
+    if(revents & POLLRDHUP) return 1;
+#endif
+    return (revents & POLLHUP) != 0;
+}
+
+static enum twosocks_connection_state relay_data(
+    int infd,
+    int outfd,
+    char *buf,
+    size_t buf_size,
+    size_t *pending_downloaded_bytes,
+    size_t *pending_uploaded_bytes,
+    int counts_as_upload
+) {
+    ssize_t sent = 0;
+    ssize_t n = read(infd, buf, buf_size);
+    if(n == 0) return TWOSOCKS_CONNECTION_CLOSED;
+    if(n < 0) return TWOSOCKS_CONNECTION_ERROR;
+
+    while(sent < n) {
+        ssize_t m = write(outfd, buf + sent, n - sent);
+        if(m < 0) return TWOSOCKS_CONNECTION_ERROR;
+        sent += m;
+    }
+
+    if(counts_as_upload) {
+        *pending_uploaded_bytes += (size_t)n;
+        if(*pending_uploaded_bytes >= TCP_COPY_ACCOUNTING_FLUSH_BYTES) {
+            record_uploaded_bytes(*pending_uploaded_bytes);
+            *pending_uploaded_bytes = 0;
+        }
+    } else {
+        *pending_downloaded_bytes += (size_t)n;
+        if(*pending_downloaded_bytes >= TCP_COPY_ACCOUNTING_FLUSH_BYTES) {
+            record_downloaded_bytes(*pending_downloaded_bytes);
+            *pending_downloaded_bytes = 0;
+        }
+    }
+
+    return TWOSOCKS_CONNECTION_OPEN;
+}
+
 static enum twosocks_connection_state copyloop(int fd1, int fd2) {
     struct pollfd fds[2] = {
         [0] = {.fd = fd1, .events = POLLIN},
@@ -467,37 +515,52 @@ static enum twosocks_connection_state copyloop(int fd1, int fd2) {
                 flush_pending_transfer_totals(&pending_downloaded_bytes, &pending_uploaded_bytes);
                 return TWOSOCKS_CONNECTION_ERROR;
         }
-        int infd = (fds[0].revents & POLLIN) ? fd1 : fd2;
-        int outfd = infd == fd2 ? fd1 : fd2;
-        ssize_t sent = 0, n = read(infd, buf, sizeof buf);
-        if(n == 0) {
-            flush_pending_transfer_totals(&pending_downloaded_bytes, &pending_uploaded_bytes);
-            return TWOSOCKS_CONNECTION_CLOSED;
-        }
-        if(n < 0) {
+
+        if(poll_revents_have_error(fds[0].revents) || poll_revents_have_error(fds[1].revents)) {
             flush_pending_transfer_totals(&pending_downloaded_bytes, &pending_uploaded_bytes);
             return TWOSOCKS_CONNECTION_ERROR;
         }
-        while(sent < n) {
-            ssize_t m = write(outfd, buf+sent, n-sent);
-            if(m < 0) {
+
+        int handled_readable_fd = 0;
+
+        if(fds[0].revents & POLLIN) {
+            enum twosocks_connection_state result = relay_data(
+                fd1,
+                fd2,
+                buf,
+                sizeof buf,
+                &pending_downloaded_bytes,
+                &pending_uploaded_bytes,
+                1
+            );
+            handled_readable_fd = 1;
+            if(result != TWOSOCKS_CONNECTION_OPEN) {
                 flush_pending_transfer_totals(&pending_downloaded_bytes, &pending_uploaded_bytes);
-                return TWOSOCKS_CONNECTION_ERROR;
+                return result;
             }
-            sent += m;
         }
-        if(infd == fd1) {
-            pending_uploaded_bytes += (size_t)n;
-            if(pending_uploaded_bytes >= TCP_COPY_ACCOUNTING_FLUSH_BYTES) {
-                record_uploaded_bytes(pending_uploaded_bytes);
-                pending_uploaded_bytes = 0;
+
+        if(fds[1].revents & POLLIN) {
+            enum twosocks_connection_state result = relay_data(
+                fd2,
+                fd1,
+                buf,
+                sizeof buf,
+                &pending_downloaded_bytes,
+                &pending_uploaded_bytes,
+                0
+            );
+            handled_readable_fd = 1;
+            if(result != TWOSOCKS_CONNECTION_OPEN) {
+                flush_pending_transfer_totals(&pending_downloaded_bytes, &pending_uploaded_bytes);
+                return result;
             }
-        } else {
-            pending_downloaded_bytes += (size_t)n;
-            if(pending_downloaded_bytes >= TCP_COPY_ACCOUNTING_FLUSH_BYTES) {
-                record_downloaded_bytes(pending_downloaded_bytes);
-                pending_downloaded_bytes = 0;
-            }
+        }
+
+        if(!handled_readable_fd &&
+            (poll_revents_have_hangup(fds[0].revents) || poll_revents_have_hangup(fds[1].revents))) {
+            flush_pending_transfer_totals(&pending_downloaded_bytes, &pending_uploaded_bytes);
+            return TWOSOCKS_CONNECTION_CLOSED;
         }
     }
 }
