@@ -74,7 +74,6 @@ static sblist* auth_ips;
 static pthread_rwlock_t auth_ips_lock = PTHREAD_RWLOCK_INITIALIZER;
 static const struct server* server;
 static pthread_mutex_t connection_event_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t transfer_totals_lock = PTHREAD_MUTEX_INITIALIZER;
 static twosocks_connection_event_handler connection_event_handler;
 static int64_t next_connection_identifier_value = 1;
 static uint64_t total_downloaded_bytes = 0;
@@ -118,31 +117,21 @@ void twosocks_set_connection_event_handler(twosocks_connection_event_handler han
 }
 
 static void record_downloaded_bytes(size_t count) {
-    pthread_mutex_lock(&transfer_totals_lock);
-    total_downloaded_bytes += (uint64_t)count;
-    pthread_mutex_unlock(&transfer_totals_lock);
+    if(count == 0) return;
+    __atomic_fetch_add(&total_downloaded_bytes, (uint64_t)count, __ATOMIC_RELAXED);
 }
 
 static void record_uploaded_bytes(size_t count) {
-    pthread_mutex_lock(&transfer_totals_lock);
-    total_uploaded_bytes += (uint64_t)count;
-    pthread_mutex_unlock(&transfer_totals_lock);
+    if(count == 0) return;
+    __atomic_fetch_add(&total_uploaded_bytes, (uint64_t)count, __ATOMIC_RELAXED);
 }
 
 uint64_t twosocks_total_downloaded_bytes(void) {
-    uint64_t count;
-    pthread_mutex_lock(&transfer_totals_lock);
-    count = total_downloaded_bytes;
-    pthread_mutex_unlock(&transfer_totals_lock);
-    return count;
+    return __atomic_load_n(&total_downloaded_bytes, __ATOMIC_RELAXED);
 }
 
 uint64_t twosocks_total_uploaded_bytes(void) {
-    uint64_t count;
-    pthread_mutex_lock(&transfer_totals_lock);
-    count = total_uploaded_bytes;
-    pthread_mutex_unlock(&transfer_totals_lock);
-    return count;
+    return __atomic_load_n(&total_uploaded_bytes, __ATOMIC_RELAXED);
 }
 
 static int64_t next_connection_identifier(void) {

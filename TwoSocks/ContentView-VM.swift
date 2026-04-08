@@ -5,6 +5,7 @@ import SwiftUI
 private let proxyPort = 4884
 private let maxRetainedEndedConnections = 100
 private let transferPollInterval: TimeInterval = 0.5
+private let transferPublishInterval: TimeInterval = 3
 private let lifetimeDownloadedBytesKey = "lifetimeDownloadedBytes"
 private let lifetimeUploadedBytesKey = "lifetimeUploadedBytes"
 
@@ -171,6 +172,9 @@ final class ContentViewVM: ObservableObject {
     private var transferTimer: Timer?
     private var lastNativeDownloadedBytes: UInt64 = 0
     private var lastNativeUploadedBytes: UInt64 = 0
+    private var pendingDownloadedBytes: UInt64 = 0
+    private var pendingUploadedBytes: UInt64 = 0
+    private var nextTransferPublishAt: Date?
 
     #if DEBUG
     struct PreviewState {
@@ -405,6 +409,7 @@ final class ContentViewVM: ObservableObject {
     }
 
     private func applyTransferTotals(downloaded: UInt64, uploaded: UInt64) {
+        let now = Date()
         let downloadedDelta = downloaded >= lastNativeDownloadedBytes
             ? downloaded - lastNativeDownloadedBytes
             : downloaded
@@ -415,12 +420,39 @@ final class ContentViewVM: ObservableObject {
         lastNativeDownloadedBytes = downloaded
         lastNativeUploadedBytes = uploaded
 
-        guard downloadedDelta > 0 || uploadedDelta > 0 else { return }
+        if downloadedDelta > 0 || uploadedDelta > 0 {
+            pendingDownloadedBytes += downloadedDelta
+            pendingUploadedBytes += uploadedDelta
 
-        sessionDownloadedBytes += downloadedDelta
-        sessionUploadedBytes += uploadedDelta
-        lifetimeDownloadedBytes += downloadedDelta
-        lifetimeUploadedBytes += uploadedDelta
+            if nextTransferPublishAt == nil {
+                nextTransferPublishAt = now.addingTimeInterval(transferPublishInterval)
+            }
+        }
+
+        guard
+            let nextTransferPublishAt,
+            pendingDownloadedBytes > 0 || pendingUploadedBytes > 0,
+            now >= nextTransferPublishAt
+        else {
+            return
+        }
+
+        commitPendingTransferTotalsIfNeeded()
+    }
+
+    private func commitPendingTransferTotalsIfNeeded() {
+        guard pendingDownloadedBytes > 0 || pendingUploadedBytes > 0 else {
+            nextTransferPublishAt = nil
+            return
+        }
+
+        sessionDownloadedBytes += pendingDownloadedBytes
+        sessionUploadedBytes += pendingUploadedBytes
+        lifetimeDownloadedBytes += pendingDownloadedBytes
+        lifetimeUploadedBytes += pendingUploadedBytes
+        pendingDownloadedBytes = 0
+        pendingUploadedBytes = 0
+        nextTransferPublishAt = nil
         persistLifetimeTransferTotals()
     }
 
