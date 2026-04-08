@@ -13,13 +13,13 @@ I am also not recommending a deep rewrite to `Network.framework`, `kqueue`, or a
 3. [x] Fix `copyloop()` so `poll()` hangups and errors cannot make it read from the wrong socket.
 After `poll()`, the code only checks `POLLIN` and then picks `fd1` or `fd2` with a single ternary (`TwoSocks/microsocks/sockssrv.c:454-470`). If `poll()` wakes because one side has `POLLHUP` or `POLLERR` without `POLLIN`, this logic can choose the other socket and block on a fresh `read()` even though the event came from the first one. This is a correctness issue first, but it also creates avoidable stalls in the TCP hot path.
 
-4. [ ] Stop truncating UDP payloads at 1024 bytes.
+4. [x] Stop truncating UDP payloads at 1024 bytes.
 `copy_loop_udp()` allocates `MAX_SOCKS5_HEADER_LEN + 1024` and explicitly comments that it only supports up to 1024 bytes of payload (`TwoSocks/microsocks/sockssrv.c:554-555`). That is below common QUIC packet sizes and well below what SOCKS5 UDP clients may legitimately send, so larger datagrams can be clipped or broken silently. A larger scratch buffer or explicit oversize handling would improve real-world UDP behavior more than most other changes here.
 
-5. [ ] Do not tear down the whole UDP association when one remote destination fails.
+5. [x] Do not tear down the whole UDP association when one remote destination fails.
 Several UDP error paths set `association_failed = 1` and jump to `UDP_LOOP_END`, which closes every tracked UDP socket for that client association (`TwoSocks/microsocks/sockssrv.c:615-627`, `TwoSocks/microsocks/sockssrv.c:631-677`, `TwoSocks/microsocks/sockssrv.c:719-724`, `TwoSocks/microsocks/sockssrv.c:773-787`, `TwoSocks/microsocks/sockssrv.c:792-810`). That means one bad resolve, one unreachable target, or one send failure can kill unrelated UDP flows that were otherwise fine. The better tradeoff is to fail that destination, emit its error event, and keep the association alive.
 
-6. [ ] Close the leaked UDP sockets on `udp_svc_setup()` failure paths.
+6. [x] Close the leaked UDP sockets on `udp_svc_setup()` failure paths.
 `udp_svc_setup()` returns early on `connect()`, `getaddrinfo()`, and `bind()` failures without consistently closing the socket it already opened (`TwoSocks/microsocks/sockssrv.c:833-885`). Repeated bad UDP_ASSOCIATE attempts can slowly consume descriptors. This is not a rewrite, just error-path hygiene that matters once clients misbehave.
 
 7. [ ] Batch or defer `UserDefaults` writes for lifetime byte totals.
