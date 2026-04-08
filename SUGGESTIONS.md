@@ -4,7 +4,7 @@ Scope notes:
 Audio workaround stays. I did not include "remove the silent playback hack" as a suggestion.
 I am also not recommending a deep rewrite to `Network.framework`, `kqueue`, or an async reactor. For the stated target of 1-2 users and about 400 Mbps, the current thread-per-connection shape is acceptable.
 
-1. [ ] Increase the TCP relay buffer size and stop paying the accounting cost every 1 KB.
+1. [x] Increase the TCP relay buffer size and stop paying the accounting cost every 1 KB.
 `copyloop()` currently moves data through a 1024-byte buffer and records totals on every chunk (`TwoSocks/microsocks/sockssrv.c:444-477`). At roughly 400 Mbps that turns into tens of thousands of `read`/`write` iterations and global counter updates per second per direction. A moderate bump to something like 16-64 KB is a direct CPU win without changing the design, and it makes per-transfer accounting much cheaper.
 
 2. [ ] Replace the global transfer-total mutexes with atomics or with coarser-grained flushing.

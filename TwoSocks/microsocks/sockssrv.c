@@ -64,6 +64,9 @@
 #define THREAD_STACK_SIZE 32*1024
 #endif
 
+#define TCP_COPY_BUFFER_SIZE (32 * 1024)
+#define TCP_COPY_ACCOUNTING_FLUSH_BYTES (64 * 1024)
+
 static int quiet;
 static const char* auth_user;
 static const char* auth_pass;
@@ -441,11 +444,25 @@ static void send_error(int fd, enum errorcode ec) {
     write(fd, buf, 10);
 }
 
+static void flush_pending_transfer_totals(size_t *downloaded_bytes, size_t *uploaded_bytes) {
+    if(*downloaded_bytes) {
+        record_downloaded_bytes(*downloaded_bytes);
+        *downloaded_bytes = 0;
+    }
+    if(*uploaded_bytes) {
+        record_uploaded_bytes(*uploaded_bytes);
+        *uploaded_bytes = 0;
+    }
+}
+
 static enum twosocks_connection_state copyloop(int fd1, int fd2) {
     struct pollfd fds[2] = {
         [0] = {.fd = fd1, .events = POLLIN},
         [1] = {.fd = fd2, .events = POLLIN},
     };
+    char buf[TCP_COPY_BUFFER_SIZE];
+    size_t pending_downloaded_bytes = 0;
+    size_t pending_uploaded_bytes = 0;
 
     while(1) {
         /* inactive connections are reaped after 15 min to free resources.
@@ -453,27 +470,45 @@ static enum twosocks_connection_state copyloop(int fd1, int fd2) {
            when a connection is really unused. */
         switch(poll(fds, 2, 60*15*1000)) {
             case 0:
+                flush_pending_transfer_totals(&pending_downloaded_bytes, &pending_uploaded_bytes);
                 return TWOSOCKS_CONNECTION_CLOSED;
             case -1:
                 if(errno == EINTR || errno == EAGAIN) continue;
                 else perror("poll");
+                flush_pending_transfer_totals(&pending_downloaded_bytes, &pending_uploaded_bytes);
                 return TWOSOCKS_CONNECTION_ERROR;
         }
         int infd = (fds[0].revents & POLLIN) ? fd1 : fd2;
         int outfd = infd == fd2 ? fd1 : fd2;
-        char buf[1024];
         ssize_t sent = 0, n = read(infd, buf, sizeof buf);
-        if(n == 0) return TWOSOCKS_CONNECTION_CLOSED;
-        if(n < 0) return TWOSOCKS_CONNECTION_ERROR;
+        if(n == 0) {
+            flush_pending_transfer_totals(&pending_downloaded_bytes, &pending_uploaded_bytes);
+            return TWOSOCKS_CONNECTION_CLOSED;
+        }
+        if(n < 0) {
+            flush_pending_transfer_totals(&pending_downloaded_bytes, &pending_uploaded_bytes);
+            return TWOSOCKS_CONNECTION_ERROR;
+        }
         while(sent < n) {
             ssize_t m = write(outfd, buf+sent, n-sent);
-            if(m < 0) return TWOSOCKS_CONNECTION_ERROR;
+            if(m < 0) {
+                flush_pending_transfer_totals(&pending_downloaded_bytes, &pending_uploaded_bytes);
+                return TWOSOCKS_CONNECTION_ERROR;
+            }
             sent += m;
         }
         if(infd == fd1) {
-            record_uploaded_bytes((size_t)n);
+            pending_uploaded_bytes += (size_t)n;
+            if(pending_uploaded_bytes >= TCP_COPY_ACCOUNTING_FLUSH_BYTES) {
+                record_uploaded_bytes(pending_uploaded_bytes);
+                pending_uploaded_bytes = 0;
+            }
         } else {
-            record_downloaded_bytes((size_t)n);
+            pending_downloaded_bytes += (size_t)n;
+            if(pending_downloaded_bytes >= TCP_COPY_ACCOUNTING_FLUSH_BYTES) {
+                record_downloaded_bytes(pending_downloaded_bytes);
+                pending_downloaded_bytes = 0;
+            }
         }
     }
 }
@@ -856,8 +891,8 @@ int udp_svc_setup(union sockaddr_union* client_addr) {
     }
 
     int af = SOCKADDR_UNION_AF(client_addr);
-    if ( (af == AF_INET && client_addr->v4.sin_addr.s_addr != INADDR_ANY) || 
-        (af == AF_INET6 && !IN6_ARE_ADDR_EQUAL(&client_addr->v6.sin6_addr, &in6addr_any)) ) {
+    if ( (af == AF_INET && client_addr->v4.sin_addr.s_addr != INADDR_ANY) ||
+        (af == AF_INET6 && !IN6_IS_ADDR_UNSPECIFIED(&client_addr->v6.sin6_addr)) ) {
         if (connect(fd, (const struct sockaddr*)client_addr, sizeof(union sockaddr_union))) {
             perror("udp connect");
             return -1;
