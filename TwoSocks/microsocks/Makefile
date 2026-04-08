@@ -3,10 +3,12 @@
 
 prefix = /usr/local
 bindir = $(prefix)/bin
+BUILD_DIR ?= ../../.build/microsocks
 
-PROG = microsocks
-SRCS =  sockssrv.c server.c sblist.c
-OBJS = $(SRCS:.c=.o)
+PROG_NAME = microsocks
+PROG = $(BUILD_DIR)/$(PROG_NAME)
+SRCS =  main.c sockssrv.c server.c sblist.c
+OBJS = $(patsubst %.c,$(BUILD_DIR)/%.o,$(SRCS))
 
 LIBS = -lpthread
 
@@ -19,17 +21,18 @@ INSTALL = ./install.sh
 all: $(PROG)
 
 install: $(PROG)
-	$(INSTALL) -D -m 755 $(PROG) $(DESTDIR)$(bindir)/$(PROG)
+	$(INSTALL) -D -m 755 $(PROG) $(DESTDIR)$(bindir)/$(PROG_NAME)
 
 clean:
-	rm -f $(PROG)
-	rm -f $(OBJS)
+	rm -rf $(BUILD_DIR)
 
-%.o: %.c
+$(BUILD_DIR):
+	mkdir -p $(BUILD_DIR)
+
+$(BUILD_DIR)/%.o: %.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(INC) $(PIC) -c -o $@ $<
 
 $(PROG): $(OBJS)
 	$(CC) $(LDFLAGS) $(OBJS) $(LIBS) -o $@
 
 .PHONY: all clean install
-
