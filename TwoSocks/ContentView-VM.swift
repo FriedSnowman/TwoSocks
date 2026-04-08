@@ -284,6 +284,19 @@ final class ContentViewVM: ObservableObject {
         }
     }
 
+    var canRetryProxy: Bool {
+        if case .failed = serverState {
+            return true
+        }
+        return false
+    }
+
+    func retryProxy() {
+        guard canRetryProxy else { return }
+        nextProxyStartAttemptAt = .distantPast
+        refreshProxyLifecycle()
+    }
+
     fileprivate func handleServerReady() {
         isProxyStartInFlight = false
         isProxyListening = true

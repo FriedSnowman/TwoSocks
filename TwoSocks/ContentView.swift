@@ -118,6 +118,14 @@ struct ContentView: View {
                         .lineLimit(1)
                         .minimumScaleFactor(0.8)
                         .textSelection(.enabled)
+                } else if viewModel.canRetryProxy {
+                    Spacer(minLength: 12)
+
+                    Button(action: viewModel.retryProxy) {
+                        Label("Retry", systemImage: "arrow.clockwise")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
                 }
             }
             .padding(.horizontal, 16)
