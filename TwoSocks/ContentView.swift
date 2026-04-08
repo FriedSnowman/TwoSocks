@@ -1,6 +1,18 @@
 import SwiftUI
 
 class AppDelegate: NSObject, UIApplicationDelegate {
+    static var preferredProxyInterfaces: [String] {
+        #if targetEnvironment(simulator)
+            return ["en0"]
+        #else
+            return ["bridge100", "en0"]
+        #endif
+    }
+
+    static var preferredProxyInterfaceDescription: String {
+        preferredProxyInterfaces.joined(separator: "/")
+    }
+
     static func deviceIPAddress(interface: String) -> String? {
         var address: String?
         var ifaddrPointer: UnsafeMutablePointer<ifaddrs>?
@@ -14,7 +26,7 @@ class AppDelegate: NSObject, UIApplicationDelegate {
         for ptr in sequence(first: firstAddr, next: { $0.pointee.ifa_next }) {
             guard let sockaddr = ptr.pointee.ifa_addr else { continue }
 
-        let addr = sockaddr.pointee
+            let addr = sockaddr.pointee
             let name = String(cString: ptr.pointee.ifa_name)
 
             guard addr.sa_family == UInt8(AF_INET), name == interface else { continue }
@@ -38,11 +50,14 @@ class AppDelegate: NSObject, UIApplicationDelegate {
 
         return address
     }
+
+    static func proxyListenIPAddress() -> String? {
+        preferredProxyInterfaces.compactMap(deviceIPAddress(interface:)).first
+    }
 }
 
 struct ContentView: View {
     @StateObject private var viewModel: ContentViewVM
-    private let startsProxyOnAppear: Bool
 
     private let metricColumns = [
         GridItem(.flexible(), spacing: 10),
@@ -52,13 +67,11 @@ struct ContentView: View {
     @MainActor
     init() {
         _viewModel = StateObject(wrappedValue: ContentViewVM())
-        startsProxyOnAppear = true
     }
 
     @MainActor
-    init(viewModel: ContentViewVM, startsProxyOnAppear: Bool = true) {
+    init(viewModel: ContentViewVM) {
         _viewModel = StateObject(wrappedValue: viewModel)
-        self.startsProxyOnAppear = startsProxyOnAppear
     }
 
     var body: some View {
@@ -72,10 +85,6 @@ struct ContentView: View {
         .background(Color(uiColor: .systemGroupedBackground).ignoresSafeArea())
         .safeAreaInset(edge: .top, spacing: 0) {
             headerRow
-        }
-        .onAppear {
-            guard startsProxyOnAppear else { return }
-            startProxyIfPossible()
         }
     }
 
@@ -183,19 +192,6 @@ struct ContentView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }
 
-    private func startProxyIfPossible() {
-        #if targetEnvironment(simulator)
-            let candidateInterfaces = ["en0"]
-        #else
-            let candidateInterfaces = ["bridge100", "en0"]
-        #endif
-
-        if let address = candidateInterfaces.compactMap({ AppDelegate.deviceIPAddress(interface: $0) }).first {
-            viewModel.startProxy(ipAddress: address)
-        } else {
-            viewModel.setInterfaceUnavailable()
-        }
-    }
 }
 
 private struct SummaryCard<Content: View>: View {
@@ -409,9 +405,6 @@ private struct CardSurface<Content: View>: View {
 
 #if DEBUG
 #Preview("Dashboard") {
-    ContentView(
-        viewModel: ContentViewVM.previewDashboard(),
-        startsProxyOnAppear: false
-    )
+    ContentView(viewModel: ContentViewVM.previewDashboard())
 }
 #endif

@@ -25,7 +25,7 @@ Several UDP error paths set `association_failed = 1` and jump to `UDP_LOOP_END`,
 7. [ ] Batch or defer `UserDefaults` writes for lifetime byte totals.
 The Swift layer polls native totals every 0.5 seconds and immediately persists lifetime counters whenever the values changed (`TwoSocks/ContentView-VM.swift:391-425`). Under sustained traffic, that creates steady write churn for data that is not latency-sensitive. Keeping the UI refresh cadence is fine; the expensive part is the persistence frequency, which should be coarser.
 
-8. [ ] Fix the proxy start lifecycle so it can recover from late network availability and early bind failures.
+8. [x] Fix the proxy start lifecycle so it can recover from late network availability and early bind failures.
 `startProxyIfPossible()` only runs on `onAppear()`, and `hasStartedProxy` is latched before `socks_main()` has actually proven that the listener came up (`TwoSocks/ContentView.swift:186-197`, `TwoSocks/ContentView-VM.swift:261-285`). If `bridge100` or `en0` appears later, or if the listener fails once, the app gets stuck until restart. This is one of the bigger practical quality issues outside the packet loops.
 
 9. [ ] Buffer the small SOCKS handshake stages instead of assuming each stage arrives in one `recv()`.

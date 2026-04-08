@@ -78,6 +78,7 @@ static pthread_rwlock_t auth_ips_lock = PTHREAD_RWLOCK_INITIALIZER;
 static const struct server* server;
 static pthread_mutex_t connection_event_lock = PTHREAD_MUTEX_INITIALIZER;
 static twosocks_connection_event_handler connection_event_handler;
+static twosocks_server_ready_handler server_ready_handler;
 static int64_t next_connection_identifier_value = 1;
 static uint64_t total_downloaded_bytes = 0;
 static uint64_t total_uploaded_bytes = 0;
@@ -119,6 +120,12 @@ void twosocks_set_connection_event_handler(twosocks_connection_event_handler han
     pthread_mutex_unlock(&connection_event_lock);
 }
 
+void twosocks_set_server_ready_handler(twosocks_server_ready_handler handler) {
+    pthread_mutex_lock(&connection_event_lock);
+    server_ready_handler = handler;
+    pthread_mutex_unlock(&connection_event_lock);
+}
+
 static void record_downloaded_bytes(size_t count) {
     if(count == 0) return;
     __atomic_fetch_add(&total_downloaded_bytes, (uint64_t)count, __ATOMIC_RELAXED);
@@ -151,6 +158,21 @@ static twosocks_connection_event_handler current_connection_event_handler(void) 
     handler = connection_event_handler;
     pthread_mutex_unlock(&connection_event_lock);
     return handler;
+}
+
+static twosocks_server_ready_handler current_server_ready_handler(void) {
+    twosocks_server_ready_handler handler;
+    pthread_mutex_lock(&connection_event_lock);
+    handler = server_ready_handler;
+    pthread_mutex_unlock(&connection_event_lock);
+    return handler;
+}
+
+static void emit_server_ready_event(void) {
+    twosocks_server_ready_handler handler = current_server_ready_handler();
+    if(handler) {
+        handler();
+    }
 }
 
 static void emit_connection_event(
@@ -198,6 +220,15 @@ static enum errorcode socket_error_code_from_errno(int err) {
         default:
             return EC_GENERAL_FAILURE;
     }
+}
+
+static void reset_argument_parser(void) {
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
+    optreset = 1;
+    optind = 1;
+#else
+    optind = 0;
+#endif
 }
 
 
@@ -1247,6 +1278,9 @@ static void zero_arg(char *s) {
 }
 
 int socks_main(int argc, char** argv) {
+    quiet = 0;
+    reset_argument_parser();
+
     int ch;
     const char *listenip = "0.0.0.0";
     unsigned port = 1080;
@@ -1295,6 +1329,7 @@ int socks_main(int argc, char** argv) {
         return 1;
     }
     server = &s;
+    emit_server_ready_event();
 
     while(1) {
         collect(threads);

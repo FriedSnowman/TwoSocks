@@ -4,6 +4,8 @@ import SwiftUI
 
 private let proxyPort = 4884
 private let maxRetainedEndedConnections = 100
+private let proxyLifecyclePollInterval: TimeInterval = 1
+private let proxyRetryInterval: TimeInterval = 2
 private let transferPollInterval: TimeInterval = 0.5
 private let transferPublishInterval: TimeInterval = 3
 private let lifetimeDownloadedBytesKey = "lifetimeDownloadedBytes"
@@ -37,6 +39,9 @@ enum ProxyServerState: Equatable {
         case .running:
             return "Proxy is listening for new clients."
         case .failed(let code):
+            if code == 0 {
+                return "Native server exited unexpectedly."
+            }
             return "Native server exited with code \(code)."
         }
     }
@@ -132,6 +137,10 @@ private final class ConnectionEventBridge {
     static weak var receiver: ContentViewVM?
 }
 
+private final class ServerReadyBridge {
+    static weak var receiver: ContentViewVM?
+}
+
 @_cdecl("twosocks_connection_event_bridge")
 func twosocks_connection_event_bridge(
     _ identifier: Int64,
@@ -155,6 +164,13 @@ func twosocks_connection_event_bridge(
     }
 }
 
+@_cdecl("twosocks_server_ready_bridge")
+func twosocks_server_ready_bridge() {
+    Task { @MainActor in
+        ServerReadyBridge.receiver?.handleServerReady()
+    }
+}
+
 @MainActor
 final class ContentViewVM: ObservableObject {
     @Published private(set) var serverState: ProxyServerState = .starting
@@ -166,9 +182,12 @@ final class ContentViewVM: ObservableObject {
     @Published private(set) var lifetimeUploadedBytes: UInt64 = 0
 
     private var audioPlayer: AVAudioPlayer?
-    private var hasStartedProxy = false
+    private var isProxyListening = false
+    private var isProxyStartInFlight = false
     private var connectionsByID: [Int64: TrackedConnection] = [:]
     private var connectionOrder: [Int64] = []
+    private var proxyLifecycleTimer: Timer?
+    private var nextProxyStartAttemptAt = Date.distantPast
     private var transferTimer: Timer?
     private var lastNativeDownloadedBytes: UInt64 = 0
     private var lastNativeUploadedBytes: UInt64 = 0
@@ -191,9 +210,12 @@ final class ContentViewVM: ObservableObject {
     init() {
         loadLifetimeTransferTotals()
         ConnectionEventBridge.receiver = self
+        ServerReadyBridge.receiver = self
         twosocks_set_connection_event_handler(twosocks_connection_event_bridge)
+        twosocks_set_server_ready_handler(twosocks_server_ready_bridge)
         setupBackgroundAudio()
         startTransferPolling()
+        startProxyLifecycle()
     }
 
     #if DEBUG
@@ -211,10 +233,15 @@ final class ContentViewVM: ObservableObject {
     #endif
 
     deinit {
+        proxyLifecycleTimer?.invalidate()
         transferTimer?.invalidate()
 
         if ConnectionEventBridge.receiver === self {
             ConnectionEventBridge.receiver = nil
+        }
+
+        if ServerReadyBridge.receiver === self {
+            ServerReadyBridge.receiver = nil
         }
     }
 
@@ -257,17 +284,40 @@ final class ContentViewVM: ObservableObject {
         }
     }
 
-    func setInterfaceUnavailable() {
-        serverState = .waitingForNetwork
-        endpointDisplay = "bridge100/en0 not available"
+    fileprivate func handleServerReady() {
+        isProxyStartInFlight = false
+        isProxyListening = true
+        refreshEndpointAvailability()
     }
 
-    func startProxy(ipAddress: String) {
-        guard !hasStartedProxy else { return }
+    private func startProxyLifecycle() {
+        refreshProxyLifecycle()
+        proxyLifecycleTimer = Timer.scheduledTimer(withTimeInterval: proxyLifecyclePollInterval, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.refreshProxyLifecycle()
+            }
+        }
+    }
 
-        hasStartedProxy = true
+    private func refreshProxyLifecycle() {
+        if isProxyListening {
+            refreshEndpointAvailability()
+            return
+        }
+
+        guard !isProxyStartInFlight else { return }
+        guard Date() >= nextProxyStartAttemptAt else { return }
+
+        startProxy()
+    }
+
+    private func startProxy() {
+        guard !isProxyListening, !isProxyStartInFlight else { return }
+
+        isProxyStartInFlight = true
         serverState = .starting
-        endpointDisplay = "\(ipAddress):\(proxyPort)"
+        endpointDisplay = "Detecting local IP"
+        refreshEndpointAvailability()
 
         Task.detached(priority: .userInitiated) { [weak self] in
             let arguments = ["microsocks", "-p", String(proxyPort)]
@@ -283,9 +333,7 @@ final class ContentViewVM: ObservableObject {
             }
             argv[arguments.count] = nil
 
-            await self?.markServerRunning()
             let status = socks_main(argc, argv)
-            guard status != 0 else { return }
             await self?.markServerFailed(code: Int32(status))
         }
     }
@@ -345,16 +393,29 @@ final class ContentViewVM: ObservableObject {
         }
     }
 
-    private func markServerRunning() {
-        if serverState != .running {
-            serverState = .running
-        }
-    }
-
     private func markServerFailed(code: Int32) {
+        isProxyStartInFlight = false
+        isProxyListening = false
+        nextProxyStartAttemptAt = Date().addingTimeInterval(proxyRetryInterval)
+
         let failedState = ProxyServerState.failed(code)
         if serverState != failedState {
             serverState = failedState
+        }
+    }
+
+    private func refreshEndpointAvailability() {
+        guard let ipAddress = AppDelegate.proxyListenIPAddress() else {
+            if isProxyListening {
+                serverState = .waitingForNetwork
+                endpointDisplay = "\(AppDelegate.preferredProxyInterfaceDescription) not available"
+            }
+            return
+        }
+
+        endpointDisplay = "\(ipAddress):\(proxyPort)"
+        if isProxyListening {
+            serverState = .running
         }
     }
 
