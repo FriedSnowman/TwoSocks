@@ -72,11 +72,14 @@ typedef void (*twosocks_connection_event_handler)(
     int32_t error_code
 );
 
+typedef void (*twosocks_server_ready_handler)(void);
+
 #define MAX_DNS_LEN    ((2 << 8) - 1)
 #define MAX_SOCKS5_HEADER_LEN (2 + 1 + 1 + 1 + MAX_DNS_LEN + 2)
 
 int socks_main(int argc, char** argv);
 void twosocks_set_connection_event_handler(twosocks_connection_event_handler handler);
+void twosocks_set_server_ready_handler(twosocks_server_ready_handler handler);
 uint64_t twosocks_total_downloaded_bytes(void);
 uint64_t twosocks_total_uploaded_bytes(void);
 

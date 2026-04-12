@@ -15,6 +15,17 @@
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
 				Info.plist,
+				microsocks/.gitignore,
+				microsocks/COPYING,
+				"microsocks/create-dist.sh",
+				microsocks/install.sh,
+				microsocks/Makefile,
+				microsocks/main.c,
+				microsocks/microsocks,
+				microsocks/README.md,
+				microsocks/sblist.o,
+				microsocks/server.o,
+				microsocks/sockssrv.o,
 			);
 			target = 71ADDBDA2DCF9E2F008774B5 /* TwoSocks */;
 		};
